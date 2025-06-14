@@ -1,0 +1,633 @@
+{
+  "system": {
+    "name": "Tasker",
+    "language": "Go",
+    "description": "A robust and flexible Go library for managing concurrent task execution with dynamic worker scaling, resource pooling, and priority queuing. It simplifies asynchronous job processing and resource lifecycle management.",
+    "keyFeatures": [
+      "Generic Task & Resource Management",
+      "Customizable Resource Lifecycle",
+      "Worker Pooling",
+      "Dynamic Worker Scaling (Bursting)",
+      "Priority Queuing",
+      "Resource Pooling for Immediate Tasks",
+      "Customizable Health Checks",
+      "Task Retries",
+      "Graceful Shutdown",
+      "Real-time Statistics"
+    ]
+  },
+  "dependencies": {
+    "external": [],
+    "peer": [
+      {
+        "name": "context",
+        "reason": "Required for managing goroutine cancellation, timeouts, and propagating application-wide signals. Crucial for graceful shutdown and task context management.",
+        "version": ""
+      },
+      {
+        "name": "errors",
+        "reason": "Used for creating, wrapping, and inspecting Go errors. Essential for robust error handling and type checking specific error conditions.",
+        "version": ""
+      },
+      {
+        "name": "fmt",
+        "reason": "Used for formatted I/O, particularly for constructing descriptive error messages (e.g., `fmt.Errorf`) and logging within examples.",
+        "version": ""
+      },
+      {
+        "name": "log",
+        "reason": "Provides basic logging capabilities, used primarily for internal warnings/errors and within examples.",
+        "version": ""
+      },
+      {
+        "name": "sync",
+        "reason": "Provides essential synchronization primitives like `sync.WaitGroup` for coordinating goroutine shutdown and `sync.Mutex` for protecting shared state.",
+        "version": ""
+      },
+      {
+        "name": "sync/atomic",
+        "reason": "Provides low-level atomic operations for concurrent, lock-free updates to shared counters and pointers, ensuring thread safety and performance for statistics.",
+        "version": ""
+      },
+      {
+        "name": "time",
+        "reason": "Used for managing durations, delays, and scheduling periodic checks (e.g., `BurstInterval`).",
+        "version": ""
+      }
+    ]
+  },
+  "integration": {
+    "environmentRequirements": "Go 1.22 or higher. The library leverages Go generics and specific atomic types introduced in recent Go versions. No specific operating system or hardware requirements beyond a standard Go development/runtime environment.",
+    "initializationPatterns": [
+      {
+        "description": "Standard initialization of a `tasker.Runner` instance. It involves defining resource creation/destruction functions and setting basic worker parameters. Always pair with `defer manager.Stop()` for graceful shutdown.",
+        "codeExample": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"log\"\n\t\"github.com/asaidimu/tasker\"\n)\n\ntype MyCustomResource struct { ID int }\n\nfunc createResource() (*MyCustomResource, error) {\n\tfmt.Println(\"Creating MyCustomResource...\")\n\treturn &MyCustomResource{ID: 123}, nil\n}\n\nfunc destroyResource(res *MyCustomResource) error {\n\tfmt.Printf(\"Destroying MyCustomResource %d.\\n\", res.ID)\n\treturn nil\n}\n\nfunc main() {\n\tconfig := tasker.Config[*MyCustomResource]{\n\t\tOnCreate: createResource,\n\t\tOnDestroy: destroyResource,\n\t\tWorkerCount: 3,\n\t\tCtx: context.Background(),\n\t}\n\t\n\tmanager, err := tasker.NewRunner[*MyCustomResource, string](config)\n\tif err != nil {\n\t\tlog.Fatalf(\"Failed to initialize tasker: %v\", err)\n\t}\n\tdefer manager.Stop() // Essential for graceful shutdown\n\t\n\tfmt.Println(\"Tasker manager initialized.\")\n\t// ... your application logic ...\n}"
+      }
+    ],
+    "commonPitfalls": [
+      {
+        "issue": "Not calling `manager.Stop()`",
+        "solution": "Always ensure `manager.Stop()` is called when your application is shutting down, typically using `defer manager.Stop()` after `NewRunner` in `main` or a top-level goroutine."
+      },
+      {
+        "issue": "Blocking or slow `OnCreate`/`OnDestroy` functions",
+        "solution": "These functions are critical for worker startup/shutdown. Keep them fast and non-blocking. Offload any heavy initialization or cleanup to the tasks themselves if possible, or ensure external dependencies are highly available."
+      },
+      {
+        "issue": "Premature `Config.Ctx` cancellation",
+        "solution": "The context provided in `Config.Ctx` controls the entire `tasker` lifecycle. If it's cancelled early, the manager will shut down, rejecting new tasks. Ensure this context has the same lifecycle as your application's `tasker` usage."
+      }
+    ],
+    "lifecycleDependencies": "The `tasker.Runner` instance should be initialized during application startup using `NewRunner`. Its operational phase coincides with the application's active processing. During application shutdown, `manager.Stop()` must be called to ensure all worker goroutines complete their current tasks, resources are properly deallocated via `OnDestroy`, and internal channels are closed cleanly. The `Runner`'s lifecycle is directly managed by the `context.Context` provided in its `Config`."
+  },
+  "types": {
+    "Config": {
+      "id": "type:Config",
+      "definition": "type Config[R any] struct { OnCreate func() (R, error); OnDestroy func(R) error; WorkerCount int; Ctx context.Context; CheckHealth func(error) bool; BurstTaskThreshold int; BurstWorkerCount int; MaxWorkerCount int; BurstInterval time.Duration; MaxRetries int; ResourcePoolSize int }",
+      "purpose": "Holds configuration parameters for initializing a new `Runner` instance, controlling worker behavior, resource management, and scaling policies.",
+      "related": {
+        "methods": [
+          "method:NewRunner"
+        ],
+        "patterns": [
+          "pattern:BasicManagerInitialization",
+          "pattern:CustomResourceManagement",
+          "pattern:DynamicBurstingSetup"
+        ]
+      },
+      "interfaceContract": {
+        "requiredMethods": [],
+        "optionalMethods": [],
+        "parameterObjectStructures": {
+          "OnCreate": "func() (R, error) // Function to create and initialize a new resource of type R. Required.",
+          "OnDestroy": "func(R) error // Function to perform cleanup or deallocation for a resource of type R. Required.",
+          "WorkerCount": "int // Initial and minimum number of base workers. Must be > 0. Required.",
+          "Ctx": "context.Context // Parent context for the Runner. Cancelling this context initiates graceful shutdown. Required.",
+          "CheckHealth": "func(error) bool // Optional: Function that determines if an error indicates an \"unhealthy\" state for a worker/resource. Default: `func(error) bool { return true }` (all errors healthy).",
+          "BurstTaskThreshold": "int // Optional: Queue size that triggers burst worker creation. If 0, bursting is disabled.",
+          "BurstWorkerCount": "int // Optional: Number of burst workers to create at a time. Defaults to 2 if <= 0. Ignored if `BurstTaskThreshold` is 0.",
+          "MaxWorkerCount": "int // Optional: Maximum total number of workers (base + burst) allowed. Defaults to `WorkerCount + BurstWorkerCount` if <= 0.",
+          "BurstInterval": "time.Duration // Optional: Frequency at which burst manager checks queue sizes. Defaults to 100 * time.Millisecond if <= 0.",
+          "MaxRetries": "int // Optional: Maximum number of times a task will be re-queued if it fails and CheckHealth indicates an unhealthy state. Defaults to 3 if <= 0.",
+          "ResourcePoolSize": "int // Optional: Number of resources to pre-allocate for `RunTask` operations. Defaults to `WorkerCount` if <= 0."
+        }
+      }
+    },
+    "TaskStats": {
+      "id": "type:TaskStats",
+      "definition": "type TaskStats struct { BaseWorkers int32; ActiveWorkers int32; BurstWorkers int32; QueuedTasks int32; PriorityTasks int32; AvailableResources int32 }",
+      "purpose": "Provides insight into the task manager's current state and performance, including worker counts, queued tasks, and resource availability.",
+      "related": {
+        "methods": [
+          "method:Stats"
+        ],
+        "patterns": []
+      },
+      "interfaceContract": {
+        "requiredMethods": [],
+        "optionalMethods": [],
+        "parameterObjectStructures": {}
+      }
+    },
+    "R": {
+      "id": "type:R",
+      "definition": "any",
+      "purpose": "A generic type parameter representing the Resource type managed by the Tasker. This can be any Go type (e.g., `*sql.DB`, `*http.Client`, `*ImageProcessor`).",
+      "related": {
+        "methods": [
+          "method:NewRunner",
+          "method:QueueTask",
+          "method:RunTask",
+          "method:QueueTaskWithPriority"
+        ],
+        "patterns": [
+          "pattern:CustomResourceManagement"
+        ]
+      },
+      "interfaceContract": {
+        "requiredMethods": [],
+        "optionalMethods": [],
+        "parameterObjectStructures": {}
+      }
+    },
+    "E": {
+      "id": "type:E",
+      "definition": "any",
+      "purpose": "A generic type parameter representing the expected Result type returned by tasks executed by the Tasker. This can be any Go type (e.g., `string`, `int`, `struct{}` or `any`).",
+      "related": {
+        "methods": [
+          "method:NewRunner",
+          "method:QueueTask",
+          "method:RunTask",
+          "method:QueueTaskWithPriority"
+        ],
+        "patterns": [
+          "pattern:BasicTaskQueueing"
+        ]
+      },
+      "interfaceContract": {
+        "requiredMethods": [],
+        "optionalMethods": [],
+        "parameterObjectStructures": {}
+      }
+    }
+  },
+  "methods": {
+    "NewRunner": {
+      "id": "method:NewRunner",
+      "useCase": "To initialize and start a new `tasker` instance with specified configurations for worker management, resource lifecycle, and scaling. This is the entry point to using the library.",
+      "signature": "func NewRunner[R any, E any](config Config[R]) (TaskManager[R, E], error)",
+      "parameters": "config: `tasker.Config[R]` - A struct containing all necessary parameters for configuring the `Runner`, including `OnCreate`, `OnDestroy`, `WorkerCount`, `Ctx`, and optional scaling/health check settings.",
+      "prerequisites": "1. `config.WorkerCount` must be greater than 0. \n2. `config.OnCreate` must be a non-nil function. \n3. `config.OnDestroy` must be a non-nil function. \n4. The `R` type parameter must be compatible with the return type of `OnCreate` and the parameter type of `OnDestroy`.",
+      "sideEffects": "1. Starts `Config.WorkerCount` base worker goroutines.\n2. Initializes and populates the `ResourcePool` with `Config.ResourcePoolSize` resources.\n3. Starts a burst manager goroutine if bursting is configured.\n4. Creates a child `context.Context` derived from `config.Ctx` for internal use.",
+      "returnValue": "Returns an interface `TaskManager[R, E]` (the concrete `Runner` instance) and an `error`. The error is non-nil if initialization fails (e.g., invalid config, resource creation failure).",
+      "exceptions": [
+        "InvalidConfigurationError",
+        "ResourceCreationError"
+      ],
+      "availability": "sync",
+      "status": "active",
+      "related": {
+        "types": [
+          "type:Config",
+          "type:R",
+          "type:E"
+        ],
+        "patterns": [
+          "pattern:BasicManagerInitialization"
+        ],
+        "errors": [
+          "error:InvalidConfigurationError",
+          "error:ResourceCreationError"
+        ]
+      }
+    },
+    "QueueTask": {
+      "id": "method:QueueTask",
+      "useCase": "To submit an asynchronous task for execution by an available worker. Ideal for background jobs or operations that do not require immediate, synchronous results.",
+      "signature": "func (r *Runner[R, E]) QueueTask(task func(R) (E, error)) (E, error)",
+      "parameters": "task: `func(R) (E, error)` - A function representing the unit of work. It takes a resource of type `R` and returns a result of type `E` or an error.",
+      "prerequisites": "1. The `tasker` manager must be initialized and not shutting down. \n2. The `mainQueue` must not be full (though it's buffered).",
+      "sideEffects": "1. Adds a task to the `mainQueue`.\n2. Increments `TaskStats.QueuedTasks`.\n3. A worker will eventually consume the task, use a resource, and potentially change external state based on the task logic.",
+      "returnValue": "Returns `E` (the result of the task) and an `error`. The caller blocks until the task completes or an error occurs (e.g., manager shutting down, task failure).",
+      "exceptions": [
+        "TaskQueuingFailedError",
+        "TaskProcessingError",
+        "MaxRetriesExceededError",
+        "UnhealthyWorkerError"
+      ],
+      "availability": "sync",
+      "status": "active",
+      "related": {
+        "types": [
+          "type:R",
+          "type:E"
+        ],
+        "patterns": [
+          "pattern:BasicTaskQueueing",
+          "pattern:UnhealthyWorkerReplacement"
+        ],
+        "errors": [
+          "error:TaskQueuingFailedError",
+          "error:TaskProcessingError",
+          "error:MaxRetriesExceededError",
+          "error:UnhealthyWorkerError"
+        ]
+      }
+    },
+    "RunTask": {
+      "id": "method:RunTask",
+      "useCase": "To execute a task immediately and synchronously, bypassing queues. Suitable for urgent, short-lived operations where a result is needed without delay. It tries to borrow from a resource pool or creates a temporary resource.",
+      "signature": "func (r *Runner[R, E]) RunTask(task func(R) (E, error)) (E, error)",
+      "parameters": "task: `func(R) (E, error)` - A function representing the unit of work. It takes a resource of type `R` and returns a result of type `E` or an error.",
+      "prerequisites": "The `tasker` manager must be initialized and not shutting down.",
+      "sideEffects": "1. Acquires a resource (from pool or temporary creation).\n2. Executes the task, potentially changing external state.\n3. If resource was temporary, destroys it via `OnDestroy`.\n4. If resource was from pool, returns it to the pool.",
+      "returnValue": "Returns `E` (the result of the task) and an `error`. The caller blocks until the task completes.",
+      "exceptions": [
+        "TaskQueuingFailedError",
+        "ResourceCreationError",
+        "TaskProcessingError"
+      ],
+      "availability": "sync",
+      "status": "active",
+      "related": {
+        "types": [
+          "type:R",
+          "type:E"
+        ],
+        "patterns": [
+          "pattern:ImmediateTaskExecution"
+        ],
+        "errors": [
+          "error:TaskQueuingFailedError",
+          "error:ResourceCreationError",
+          "error:TaskProcessingError"
+        ]
+      }
+    },
+    "QueueTaskWithPriority": {
+      "id": "method:QueueTaskWithPriority",
+      "useCase": "To submit an asynchronous task that should be processed before any tasks in the main queue. Ideal for critical or time-sensitive background operations.",
+      "signature": "func (r *Runner[R, E]) QueueTaskWithPriority(task func(R) (E, error)) (E, error)",
+      "parameters": "task: `func(R) (E, error)` - A function representing the unit of work. It takes a resource of type `R` and returns a result of type `E` or an error.",
+      "prerequisites": "1. The `tasker` manager must be initialized and not shutting down. \n2. The `priorityQueue` must not be full (though it's buffered).",
+      "sideEffects": "1. Adds a task to the `priorityQueue`.\n2. Increments `TaskStats.PriorityTasks`.\n3. A worker will eventually consume the task (prioritized), use a resource, and potentially change external state based on the task logic.",
+      "returnValue": "Returns `E` (the result of the task) and an `error`. The caller blocks until the task completes or an error occurs (e.g., manager shutting down, task failure).",
+      "exceptions": [
+        "TaskQueuingFailedError",
+        "TaskProcessingError",
+        "MaxRetriesExceededError",
+        "UnhealthyWorkerError"
+      ],
+      "availability": "sync",
+      "status": "active",
+      "related": {
+        "types": [
+          "type:R",
+          "type:E"
+        ],
+        "patterns": [
+          "pattern:HighPriorityTask",
+          "pattern:UnhealthyWorkerReplacement"
+        ],
+        "errors": [
+          "error:TaskQueuingFailedError",
+          "error:TaskProcessingError",
+          "error:MaxRetriesExceededError",
+          "error:UnhealthyWorkerError"
+        ]
+      }
+    },
+    "Stop": {
+      "id": "method:Stop",
+      "useCase": "To gracefully shut down the `tasker` manager. This ensures all in-flight tasks complete, workers exit cleanly, and all managed resources are properly released.",
+      "signature": "func (r *Runner[R, E]) Stop() error",
+      "parameters": "None.",
+      "prerequisites": "The `tasker` manager must be initialized.",
+      "sideEffects": "1. Signals the burst manager to stop.\n2. Cancels all burst workers and base workers (allowing current tasks to finish).\n3. Waits for all worker and manager goroutines to exit.\n4. Drains and destroys all resources remaining in the `ResourcePool`.",
+      "returnValue": "Returns an `error` if any part of the shutdown process encounters an issue (e.g., `onDestroy` fails for a resource). Nil indicates successful shutdown.",
+      "exceptions": [
+        "ResourceDestructionError"
+      ],
+      "availability": "sync",
+      "status": "active",
+      "related": {
+        "types": [],
+        "patterns": [
+          "pattern:GracefulManagerShutdown"
+        ],
+        "errors": [
+          "error:ResourceDestructionError"
+        ]
+      }
+    },
+    "Stats": {
+      "id": "method:Stats",
+      "useCase": "To retrieve current operational statistics of the `tasker` manager, providing a real-time snapshot of worker counts, queued tasks, and resource availability.",
+      "signature": "func (r *Runner[R, E]) Stats() TaskStats",
+      "parameters": "None.",
+      "prerequisites": "The `tasker` manager must be initialized.",
+      "sideEffects": "None. This method is read-only and does not alter the manager's state.",
+      "returnValue": "Returns a `tasker.TaskStats` struct containing the current statistics.",
+      "exceptions": [],
+      "availability": "sync",
+      "status": "active",
+      "related": {
+        "types": [
+          "type:TaskStats"
+        ],
+        "patterns": []
+      }
+    }
+  },
+  "decisionTrees": {
+    "ChooseTaskExecutionMethod": {
+      "id": "decisionTree:ChooseTaskExecutionMethod",
+      "question": "How should a task be executed?",
+      "logic": "IF goal IS background_processing AND immediacy_is_not_critical THEN USE QueueTask ELSE IF goal IS background_processing AND immediacy_is_critical THEN USE QueueTaskWithPriority ELSE IF goal IS synchronous_and_immediate_execution THEN USE RunTask",
+      "validationMethod": "Observe if the task is processed asynchronously (for QueueTask/QueueTaskWithPriority) or synchronously (for RunTask). Check queue sizes (Stats()) to confirm task placement.",
+      "related": {
+        "methods": [
+          "method:QueueTask",
+          "method:RunTask",
+          "method:QueueTaskWithPriority"
+        ],
+        "patterns": [
+          "pattern:BasicTaskQueueing",
+          "pattern:HighPriorityTask",
+          "pattern:ImmediateTaskExecution"
+        ]
+      }
+    },
+    "ImplementHealthCheck": {
+      "id": "decisionTree:ImplementHealthCheck",
+      "question": "Should a custom health check (`CheckHealth`) be implemented?",
+      "logic": "IF task_failure_can_indicate_unhealthy_resource OR task_requires_retries_on_specific_failures THEN IMPLEMENT Config.CheckHealth ELSE DO_NOT_IMPLEMENT Config.CheckHealth (use default)",
+      "validationMethod": "Trigger a task error that `CheckHealth` is designed to catch. Observe if the worker is replaced (via `OnDestroy`/`OnCreate` logs) and if the task is re-queued.",
+      "related": {
+        "methods": [
+          "type:Config"
+        ],
+        "patterns": [
+          "pattern:UnhealthyWorkerReplacement"
+        ]
+      }
+    },
+    "ConfigureDynamicScaling": {
+      "id": "decisionTree:ConfigureDynamicScaling",
+      "question": "Should dynamic worker scaling (bursting) be enabled?",
+      "logic": "IF workload_is_variable_or_spiky THEN SET Config.BurstTaskThreshold AND SET Config.BurstWorkerCount ELSE DO_NOT_SET Config.BurstTaskThreshold (disable bursting)",
+      "validationMethod": "Submit a burst of tasks exceeding `BurstTaskThreshold`. Observe `Stats().BurstWorkers` increasing. Reduce load and observe `Stats().BurstWorkers` decreasing.",
+      "related": {
+        "methods": [
+          "type:Config",
+          "method:Stats"
+        ],
+        "patterns": [
+          "pattern:DynamicBurstingSetup"
+        ]
+      }
+    }
+  },
+  "patterns": {
+    "BasicTaskQueueing": {
+      "id": "pattern:BasicTaskQueueing",
+      "description": "Submitting a regular task to the main processing queue for asynchronous execution.",
+      "example": {
+        "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"log\"\n\t\"time\"\n\n\t\"github.com/asaidimu/tasker\"\n)\n\ntype CalcRes struct{}\nfunc createCalc() (*CalcRes, error) { return &CalcRes{}, nil }\nfunc destroyCalc(r *CalcRes) error { return nil }\n\nfunc main() {\n\tconfig := tasker.Config[*CalcRes]{\n\t\tOnCreate:    createCalc,\n\t\tOnDestroy:   destroyCalc,\n\t\tWorkerCount: 1,\n\t\tCtx:         context.Background(),\n\t}\n\tmanager, err := tasker.NewRunner[*CalcRes, int](config)\n\tif err != nil { log.Fatalf(\"Error: %v\", err) }\n\tdefer manager.Stop()\n\n\tgo func() {\n\t\tsum, err := manager.QueueTask(func(r *CalcRes) (int, error) {\n\t\t\ttime.Sleep(50 * time.Millisecond)\n\t\t\treturn 10 + 25, nil\n\t\t})\n\t\tif err != nil { fmt.Printf(\"Task failed: %v\\n\", err) }\n\t\telse { fmt.Printf(\"Addition Result: %d\\n\", sum) }\n\t}()\n\n\ttime.Sleep(200 * time.Millisecond)\n}",
+        "validation": "Output contains 'Addition Result: 35'. Task completes asynchronously."
+      },
+      "related": {
+        "methods": [
+          "method:QueueTask"
+        ],
+        "errors": [
+          "error:TaskProcessingError"
+        ]
+      }
+    },
+    "HighPriorityTask": {
+      "id": "pattern:HighPriorityTask",
+      "description": "Submitting a task that needs to be processed before other tasks in the main queue.",
+      "example": {
+        "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"log\"\n\t\"time\"\n\n\t\"github.com/asaidimu/tasker\"\n)\n\ntype ProcessRes struct{ ID int }\nfunc createProc() (*ProcessRes, error) { return &ProcessRes{ID: time.Now().Nanosecond()}, nil }\nfunc destroyProc(r *ProcessRes) error { return nil }\n\nfunc main() {\n\tconfig := tasker.Config[*ProcessRes]{\n\t\tOnCreate:    createProc,\n\t\tOnDestroy:   destroyProc,\n\t\tWorkerCount: 1,\n\t\tCtx:         context.Background(),\n\t}\n\tmanager, err := tasker.NewRunner[*ProcessRes, string](config)\n\tif err != nil { log.Fatalf(\"Error: %v\", err) }\n\tdefer manager.Stop()\n\n\t// Queue a slow normal task first\n\tgo func() {\n\t\t_, _ = manager.QueueTask(func(r *ProcessRes) (string, error) {\n\t\t\tfmt.Printf(\"Worker %d processing slow normal task.\\n\", r.ID)\n\t\t\ttime.Sleep(500 * time.Millisecond)\n\t\t\treturn \"Normal Done\", nil\n\t\t})\n\t}()\n\n\t// Queue a fast high-priority task shortly after\n\ttime.Sleep(10 * time.Millisecond)\n\tgo func() {\n\t\tresult, err := manager.QueueTaskWithPriority(func(r *ProcessRes) (string, error) {\n\t\t\tfmt.Printf(\"Worker %d processing HIGH PRIORITY task!\\n\", r.ID)\n\t\t\ttime.Sleep(50 * time.Millisecond)\n\t\t\treturn \"Priority Done\", nil\n\t\t})\n\t\tif err != nil { fmt.Printf(\"Priority task failed: %v\\n\", err) }\n\t\telse { fmt.Printf(\"Priority Task Result: %s\\n\", result) }\n\t}()\n\n\ttime.Sleep(1 * time.Second)\n}",
+        "validation": "Output shows 'Worker X processing HIGH PRIORITY task!' and 'Priority Task Result: Priority Done' appear before 'Worker Y processing slow normal task.', or very early in the sequence, demonstrating prioritization."
+      },
+      "related": {
+        "methods": [
+          "method:QueueTaskWithPriority"
+        ],
+        "errors": [
+          "error:TaskProcessingError"
+        ]
+      }
+    },
+    "ImmediateTaskExecution": {
+      "id": "pattern:ImmediateTaskExecution",
+      "description": "Executing a task synchronously and immediately, potentially borrowing a resource from a pre-allocated pool or creating a temporary one.",
+      "example": {
+        "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"log\"\n\t\"time\"\n\n\t\"github.com/asaidimu/tasker\"\n)\n\ntype PreviewRes struct{ ID int }\nfunc createPreview() (*PreviewRes, error) { fmt.Println(\"Creating PreviewRes...\"); return &PreviewRes{ID: time.Now().Nanosecond()}, nil }\nfunc destroyPreview(r *PreviewRes) error { fmt.Printf(\"Destroying PreviewRes %d.\\n\", r.ID); return nil }\n\nfunc main() {\n\tconfig := tasker.Config[*PreviewRes]{\n\t\tOnCreate: createPreview,\n\t\tOnDestroy: destroyPreview,\n\t\tWorkerCount: 0, // No base workers for this example\n\t\tCtx: context.Background(),\n\t\tResourcePoolSize: 1,\n\t}\n\tmanager, err := tasker.NewRunner[*PreviewRes, string](config)\n\tif err != nil { log.Fatalf(\"Error: %v\", err) }\n\tdefer manager.Stop()\n\n\tfmt.Println(\"Running immediate task...\")\n\tresult, err := manager.RunTask(func(r *PreviewRes) (string, error) {\n\t\tfmt.Printf(\"Processing immediate task with resource %d.\\n\", r.ID)\n\t\ttime.Sleep(20 * time.Millisecond)\n\t\treturn \"Quick Preview Generated\", nil\n\t})\n\tif err != nil { fmt.Printf(\"Immediate task failed: %v\\n\", err) }\n\telse { fmt.Printf(\"Immediate Task Result: %s\\n\", result) }\n\n\ttime.Sleep(100 * time.Millisecond)\n}",
+        "validation": "Output shows 'Processing immediate task with resource X.' followed immediately by 'Immediate Task Result: Quick Preview Generated', confirming synchronous execution. 'Creating PreviewRes...' and 'Destroying PreviewRes...' appear around the task execution."
+      },
+      "related": {
+        "methods": [
+          "method:RunTask"
+        ],
+        "errors": [
+          "error:ResourceCreationError"
+        ]
+      }
+    },
+    "GracefulManagerShutdown": {
+      "id": "pattern:GracefulManagerShutdown",
+      "description": "Ensuring the `tasker` manager and all its resources are properly stopped and cleaned up before application exit.",
+      "example": {
+        "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"log\"\n\t\"time\"\n\n\t\"github.com/asaidimu/tasker\"\n)\n\ntype CleanRes struct{ ID int }\nfunc createClean() (*CleanRes, error) { fmt.Println(\"Creating CleanRes...\"); return &CleanRes{ID: time.Now().Nanosecond()}, nil }\nfunc destroyClean(r *CleanRes) error { fmt.Printf(\"Destroying CleanRes %d.\\n\", r.ID); return nil }\n\nfunc main() {\n\tconfig := tasker.Config[*CleanRes]{\n\t\tOnCreate:    createClean,\n\t\tOnDestroy:   destroyClean,\n\t\tWorkerCount: 2,\n\t\tCtx:         context.Background(),\n\t}\n\tmanager, err := tasker.NewRunner[*CleanRes, string](config)\n\tif err != nil { log.Fatalf(\"Error: %v\", err) }\n\t\n\t// Crucial: Ensure manager.Stop() is called on exit\n\tdefer func() {\n\t\tfmt.Println(\"\\nInitiating graceful shutdown...\")\n\t\terr := manager.Stop()\n\t\tif err != nil { fmt.Printf(\"Shutdown error: %v\\n\", err) }\n\t\telse { fmt.Println(\"Task manager gracefully shut down.\") }\n\t}()\n\n\t// Queue a task that takes some time, to be finished during shutdown\n\tgo func() {\n\t\t_, _ = manager.QueueTask(func(r *CleanRes) (string, error) {\n\t\t\tfmt.Printf(\"Worker %d processing task during runtime.\\n\", r.ID)\n\t\t\ttime.Sleep(200 * time.Millisecond)\n\t\t\treturn \"Done\", nil\n\t\t})\n\t}()\n\n\ttime.Sleep(100 * time.Millisecond) // Give time for task to start\n\tfmt.Println(\"Application main function exiting.\")\n\t// The defer function will now execute\n}",
+        "validation": "Output shows 'Initiating graceful shutdown...', 'Worker X processing task...', 'Destroying CleanRes Y.', and 'Task manager gracefully shut down.', confirming in-flight tasks complete and resources are destroyed."
+      },
+      "related": {
+        "methods": [
+          "method:Stop"
+        ],
+        "errors": [
+          "error:ResourceDestructionError"
+        ]
+      }
+    },
+    "CustomResourceManagement": {
+      "id": "pattern:CustomResourceManagement",
+      "description": "Implementing custom `OnCreate` and `OnDestroy` functions to manage the lifecycle of task-specific resources like database connections or API clients.",
+      "example": {
+        "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"log\"\n\t\"time\"\n\n\t\"github.com/asaidimu/tasker\"\n)\n\n// DatabasePoolConn represents a resource: a connection from a DB pool\ntype DatabasePoolConn struct {\n\tID   int\n\tPool *string // Simulate a connection pool handle\n}\n\n// simulate an external database connection pool\nvar globalDBPool = \"DB_POOL_ACTIVE\"\n\nfunc createDBConnection() (*DatabasePoolConn, error) {\n\tif globalDBPool != \"DB_POOL_ACTIVE\" {\n\t\treturn nil, fmt.Errorf(\"DB pool not active\")\n\t}\n\tid := time.Now().Nanosecond()\n\tfmt.Printf(\"INFO: Acquiring DB connection %d from pool.\\n\", id)\n\treturn &DatabasePoolConn{ID: id, Pool: &globalDBPool}, nil\n}\n\nfunc releaseDBConnection(conn *DatabasePoolConn) error {\n\tfmt.Printf(\"INFO: Releasing DB connection %d back to pool.\\n\", conn.ID)\n\treturn nil\n}\n\nfunc main() {\n\tconfig := tasker.Config[*DatabasePoolConn]{\n\t\tOnCreate:    createDBConnection,\n\t\tOnDestroy:   releaseDBConnection,\n\t\tWorkerCount: 2,\n\t\tCtx:         context.Background(),\n\t}\n\tmanager, err := tasker.NewRunner[*DatabasePoolConn, string](config)\n\tif err != nil {\n\t\tlog.Fatalf(\"Error creating task manager: %v\", err)\n\t}\n\tdefer manager.Stop()\n\n\tgo func() {\n\t\t_, _ = manager.QueueTask(func(conn *DatabasePoolConn) (string, error) {\n\t\t\tfmt.Printf(\"Worker using DB connection %d to run query.\\n\", conn.ID)\n\t\t\ttime.Sleep(50 * time.Millisecond)\n\t\t\treturn \"Query Result\", nil\n\t\t})\n\t}()\n\n\ttime.Sleep(200 * time.Millisecond)\n}",
+        "validation": "Output shows 'INFO: Acquiring DB connection X from pool.' messages when workers start and 'INFO: Releasing DB connection Y back to pool.' when workers shut down or resources are released."
+      },
+      "related": {
+        "methods": [
+          "type:Config"
+        ],
+        "errors": [
+          "error:ResourceCreationError",
+          "error:ResourceDestructionError"
+        ]
+      }
+    },
+    "UnhealthyWorkerReplacement": {
+      "id": "pattern:UnhealthyWorkerReplacement",
+      "description": "Configuring `CheckHealth` and `MaxRetries` to automatically replace workers whose resources become unhealthy and retry their tasks.",
+      "example": {
+        "code": "package main\n\nimport (\n\t\"context\"\n\t\"errors\"\n\t\"fmt\"\n\t\"log\"\n\t\"math/rand\"\n\t\"time\"\n\n\t\"github.com/asaidimu/tasker\"\n)\n\ntype ExternalAPICaller struct { ID int }\n\nfunc createAPICaller() (*ExternalAPICaller, error) {\n\tid := rand.Intn(1000)\n\tfmt.Printf(\"INFO: Creating ExternalAPICaller %d.\\n\", id)\n\treturn &ExternalAPICaller{ID: id}, nil\n}\n\nfunc destroyAPICaller(caller *ExternalAPICaller) error {\n\tfmt.Printf(\"INFO: Destroying ExternalAPICaller %d.\\n\", caller.ID)\n\treturn nil\n}\n\nfunc checkAPIHealth(err error) bool {\n\tif err != nil && err.Error() == \"api_auth_expired\" {\n\t\tfmt.Printf(\"WARN: Auth expired, API caller unhealthy. %v\\n\", err)\n\t\treturn false // Indicate unhealthy worker\n\t}\n\treturn true\n}\n\nfunc main() {\n\tconfig := tasker.Config[*ExternalAPICaller]{\n\t\tOnCreate:    createAPICaller,\n\t\tOnDestroy:   destroyAPICaller,\n\t\tWorkerCount: 1,\n\t\tCtx:         context.Background(),\n\t\tCheckHealth: checkAPIHealth,\n\t\tMaxRetries:  1,\n\t}\n\tmanager, err := tasker.NewRunner[*ExternalAPICaller, string](config)\n\tif err != nil { log.Fatalf(\"Error: %v\", err) }\n\tdefer manager.Stop()\n\n\tgo func() {\n\t\tfmt.Println(\"Queuing task that might fail with unhealthy error...\")\n\t\tresult, err := manager.QueueTask(func(caller *ExternalAPICaller) (string, error) {\n\t\t\tfmt.Printf(\"Worker %d calling API.\\n\", caller.ID)\n\t\t\ttime.Sleep(100 * time.Millisecond)\n\t\t\tif rand.Intn(2) == 0 { // 50% chance to fail unhealthily\n\t\t\t\treturn \"\", errors.New(\"api_auth_expired\")\n\t\t\t}\n\t\t\treturn \"API call successful\", nil\n\t\t})\n\t\tif err != nil { fmt.Printf(\"Task finished with error: %v\\n\", err) }\n\t\telse { fmt.Printf(\"Task finished with result: %s\\n\", result) }\n\t}()\n\n\ttime.Sleep(1 * time.Second)\n}",
+        "validation": "If the unhealthy error occurs, output shows 'WARN: Auth expired...' followed by 'INFO: Destroying ExternalAPICaller X.' and 'INFO: Creating ExternalAPICaller Y.', indicating worker replacement and task retry (if `MaxRetries > 0`)."
+      },
+      "related": {
+        "methods": [
+          "type:Config",
+          "method:QueueTask"
+        ],
+        "errors": [
+          "error:UnhealthyWorkerError",
+          "error:MaxRetriesExceededError"
+        ]
+      }
+    },
+    "DynamicBurstingSetup": {
+      "id": "pattern:DynamicBurstingSetup",
+      "description": "Configuring `tasker` to automatically scale its worker count up and down based on the number of pending tasks.",
+      "example": {
+        "code": "package main\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"log\"\n\t\"sync/atomic\"\n\t\"time\"\n\n\t\"github.com/asaidimu/tasker\"\n)\n\ntype ComputeRes struct{ ID int }\nfunc createCompute() (*ComputeRes, error) { fmt.Printf(\"INFO: Creating ComputeRes %d\\n\", time.Now().Nanosecond()); return &ComputeRes{ID: time.Now().Nanosecond()}, nil }\nfunc destroyCompute(r *ComputeRes) error { fmt.Printf(\"INFO: Destroying ComputeRes %d\\n\", r.ID); return nil }\n\nfunc main() {\n\tctx, cancel := context.WithCancel(context.Background())\n\tdefer cancel()\n\n\tconfig := tasker.Config[*ComputeRes]{\n\t\tOnCreate:        createCompute,\n\t\tOnDestroy:       destroyCompute,\n\t\tWorkerCount:     1,                   // Start with 1 base worker\n\t\tCtx:             ctx,\n\t\tBurstTaskThreshold:  3,                   // If 3+ tasks in queue, start bursting\n\t\tBurstWorkerCount:      1,                   // Add 1 burst worker at a time\n\t\tBurstInterval:   100 * time.Millisecond, // Check frequently\n\t\tMaxWorkerCount:  5,\n\t}\n\tmanager, err := tasker.NewRunner[*ComputeRes, string](config)\n\tif err != nil { log.Fatalf(\"Error: %v\", err) }\n\tdefer manager.Stop()\n\n\tvar tasksSubmitted atomic.Int32\n\n\tfmt.Println(\"Submitting 10 tasks to trigger bursting...\")\n\tfor i := range 10 {\n\t\ttaskID := i\n\t\ttasksSubmitted.Add(1)\n\t\tgo func() {\n\t\t\t_, _ = manager.QueueTask(func(res *ComputeRes) (string, error) {\n\t\t\t\tfmt.Printf(\"Worker %d processing Task %d.\\n\", res.ID, taskID)\n\t\t\t\ttime.Sleep(200 * time.Millisecond)\n\t\t\t\treturn \"Done\", nil\n\t\t\t})\n\t\t}()\n\t}\n\n\tgo func() {\n\t\tticker := time.NewTicker(200 * time.Millisecond)\n\t\tdefer ticker.Stop()\n\t\tfor {\n\t\t\tselect {\n\t\t\tcase <-ctx.Done(): return\n\t\t\tcase <-ticker.C:\n\t\t\t\tstats := manager.Stats()\n\t\t\t\tfmt.Printf(\"Stats: Active=%d (Base=%d, Burst=%d), Queued=%d\\n\", stats.ActiveWorkers, stats.BaseWorkers, stats.BurstWorkers, stats.QueuedTasks+stats.PriorityTasks)\n\t\t\t}\n\t\t}\n\t}()\n\n\ttime.Sleep(3 * time.Second) // Allow time for bursting to occur\n}",
+        "validation": "Output of `Stats` shows `BurstWorkers` increasing (from 0 to >0) when `QueuedTasks` exceeds `BurstTaskThreshold`, and decreasing when the queue clears, demonstrating dynamic scaling."
+      },
+      "related": {
+        "methods": [
+          "type:Config",
+          "method:Stats"
+        ],
+        "errors": []
+      }
+    }
+  },
+  "errors": {
+    "InvalidConfigurationError": {
+      "id": "error:InvalidConfigurationError",
+      "type": "error",
+      "symptoms": "`tasker.NewRunner` returns an error message like \"worker count must be positive\", \"onCreate function is required\", or \"onDestroy function is required\".",
+      "properties": "Typically, the error object is a standard `error` containing a descriptive string.",
+      "scenarios": [
+        {
+          "trigger": "`Config.WorkerCount` is set to 0 or a negative value.",
+          "example": "config := tasker.Config[*MyResource]{ WorkerCount: 0, /* ... */ }\n_, err := tasker.NewRunner[*MyResource, any](config)",
+          "reason": "The system requires at least one worker to operate."
+        },
+        {
+          "trigger": "`Config.OnCreate` or `Config.OnDestroy` are `nil`.",
+          "example": "config := tasker.Config[*MyResource]{ OnCreate: nil, /* ... */ }\n_, err := tasker.NewRunner[*MyResource, any](config)",
+          "reason": "Resource lifecycle management functions are mandatory for `tasker` to know how to manage `R` resources."
+        }
+      ],
+      "diagnosis": "Inspect the error message returned by `NewRunner` for specific configuration parameter issues. Verify `Config` fields against documentation.",
+      "resolution": "Correct the invalid configuration parameter(s) in the `tasker.Config` struct before calling `NewRunner`.",
+      "prevention": "Always validate `Config` parameters or rely on the documented defaults for optional fields.",
+      "handlingPatterns": "Catch the error immediately after `NewRunner` and log/fatal if in a startup phase. ```go\nmanager, err := tasker.NewRunner[MyRes, any](config)\nif err != nil { log.Fatalf(\"Configuration error: %v\", err) }\n```",
+      "propagationBehavior": "This error is returned directly by the `NewRunner` function and prevents the `tasker` manager from being initialized. It does not propagate further unless re-thrown by the calling code."
+    },
+    "TaskQueuingFailedError": {
+      "id": "error:TaskQueuingFailedError",
+      "type": "error",
+      "symptoms": "`QueueTask`, `RunTask`, or `QueueTaskWithPriority` return an error indicating the task manager is shutting down, or (less common for `tasker` due to buffering) a queue is full.",
+      "properties": "Standard `error` with a descriptive message like \"task manager is shutting down: cannot queue task\" or \"priority queue full, task requeue failed\".",
+      "scenarios": [
+        {
+          "trigger": "Attempting to queue a task after `manager.Stop()` has been called, or if the `Config.Ctx` context is cancelled.",
+          "example": "manager.Stop()\n_, err := manager.QueueTask(/* ... */)",
+          "reason": "The task manager is no longer accepting new tasks as it's in a shutdown state."
+        },
+        {
+          "trigger": "An unhealthy task is attempting to be re-queued, but the priority queue is full.",
+          "example": "(Internal scenario, not directly callable) A task fails with an unhealthy error and hits `maxRetries`, but `priorityQueue` cannot accept the re-queued task.",
+          "reason": "The internal priority queue buffer is exhausted, preventing re-queueing of a failed task."
+        }
+      ],
+      "diagnosis": "Check the `tasker` manager's lifecycle. Verify if `Stop()` was called, or if the main context was cancelled. For internal re-queueing failures, check logs for `priority queue full` messages and consider increasing `WorkerCount` or `priorityQueue` buffer size (not directly configurable via `Config`).",
+      "resolution": "Ensure tasks are only queued when the manager is active. If queue full errors occur during retries, review system load and worker capacity. For `manager is shutting down` errors, the correct resolution is to acknowledge the shutdown and stop submitting tasks.",
+      "prevention": "Implement application logic to prevent task submission during shutdown, or check the state of the manager's context (e.g., `select { case <-manager.Ctx().Done(): // Manager is done }`).",
+      "handlingPatterns": "Catch the error and log it, or notify the user that the operation cannot be performed. Recovery might involve retrying the operation at a later time if it's external, or gracefully aborting the request if it's application shutdown.",
+      "propagationBehavior": "This error is returned directly to the caller of `QueueTask`, `RunTask`, or `QueueTaskWithPriority`."
+    },
+    "ResourceCreationError": {
+      "id": "error:ResourceCreationError",
+      "type": "error",
+      "symptoms": "`NewRunner` fails during initialization, or `RunTask` fails when attempting to create a temporary resource.",
+      "properties": "Standard `error` wrapping the underlying error returned by your `OnCreate` function, or a generic message like \"failed to create resource for pool\".",
+      "scenarios": [
+        {
+          "trigger": "The `OnCreate` function returns an error (e.g., database connection failed, API client initialization failed).",
+          "example": "func createRes() (*MyRes, error) { return nil, errors.New(\"db connection refused\") }\nconfig := tasker.Config[*MyRes]{ OnCreate: createRes, /* ... */ }\n_, err := tasker.NewRunner[*MyRes, any](config)",
+          "reason": "The resource required by workers could not be initialized."
+        },
+        {
+          "trigger": "`RunTask` needs a temporary resource, and `OnCreate` fails.",
+          "example": "// ... OnCreate fails as above ...\n_, err := manager.RunTask(func(r *MyRes) (string, error) { /* ... */ })",
+          "reason": "An immediate task could not get a required resource."
+        }
+      ],
+      "diagnosis": "Inspect the error returned by `NewRunner` or `RunTask`. It will typically contain or wrap the error from your `OnCreate` function. Debug the `OnCreate` logic for issues with external dependencies or internal initialization.",
+      "resolution": "Resolve the root cause of the `OnCreate` failure (e.g., ensure database is reachable, API keys are valid).",
+      "prevention": "Ensure `OnCreate` is robust and handles all expected failure modes, or pre-check external dependencies before `NewRunner` call.",
+      "handlingPatterns": "For `NewRunner` errors, the application typically cannot proceed and should log/exit. For `RunTask` errors, report the failure to the user or retry the operation.",
+      "propagationBehavior": "This error is returned directly by `NewRunner` or `RunTask`."
+    },
+    "MaxRetriesExceededError": {
+      "id": "error:MaxRetriesExceededError",
+      "type": "error",
+      "symptoms": "`QueueTask` or `QueueTaskWithPriority` return an error indicating that a task failed with an unhealthy error and exhausted all retries.",
+      "properties": "Standard `error` wrapping the original unhealthy error, with a message like \"max retries exceeded for task: original_error_message\".",
+      "scenarios": [
+        {
+          "trigger": "A task consistently returns an error for which `CheckHealth` returns `false`, and the task has been re-queued `Config.MaxRetries` times without success.",
+          "example": "// Given CheckHealth returns false for 'processor_crash'\n// And MaxRetries is 1\nmanager.QueueTask(func(res *ImageProcessor) (string, error) { return \"\", errors.New(\"processor_crash\") }) // First failure\n// Task re-queued, runs on new worker\nmanager.QueueTask(func(res *ImageProcessor) (string, error) { return \"\", errors.New(\"processor_crash\") }) // Second failure, MaxRetries exceeded",
+          "reason": "The task or the underlying resource it requires is persistently unhealthy, and `tasker` has given up trying to process it."
+        }
+      ],
+      "diagnosis": "Examine the wrapped original error (`errors.Unwrap(err)`) to understand the root cause of the persistent unhealthy state. This indicates a systemic issue, not a transient one. Check `OnCreate` logic, external dependencies, or the task logic itself if it's causing the unhealthy state.",
+      "resolution": "Address the underlying cause of the persistent failure. This might involve manual intervention, resource replacement, or code fixes. `tasker` won't retry the specific task further.",
+      "prevention": "Ensure `OnCreate` creates truly healthy resources. Tune `MaxRetries` appropriately – a low number prevents endless retries for truly broken tasks, while a higher number accommodates transient issues.",
+      "handlingPatterns": "This indicates a critical task failure. Log the error, potentially alert monitoring systems, and consider manual intervention or automatic remediation external to `tasker`.",
+      "propagationBehavior": "This error is returned to the original caller of `QueueTask` or `QueueTaskWithPriority`."
+    },
+    "UnhealthyWorkerError": {
+      "id": "error:UnhealthyWorkerError",
+      "type": "error",
+      "symptoms": "This is not a direct error returned by `tasker`, but rather a conceptual category of errors *returned by your task function* that cause `tasker` to consider the worker unhealthy. Typically, logs will show messages like 'WARN: Detected unhealthy error: X. Worker will be replaced.'",
+      "properties": "Defined by your task's return `error` and your `CheckHealth` function.",
+      "scenarios": [
+        {
+          "trigger": "Your task function returns an error (e.g., `errors.New(\"database_connection_lost\")`), and your `Config.CheckHealth` function returns `false` for this specific error.",
+          "example": "// In `main`:\nconfig := tasker.Config[*DBConn]{ CheckHealth: func(err error) bool { return err == nil || err.Error() != \"db_connection_lost\" } }\n// In task:\nfunc(conn *DBConn) (any, error) { return nil, errors.New(\"db_connection_lost\") }",
+          "reason": "Your application code has identified that a specific error means the worker's resource or the worker itself is in a bad state and needs to be replaced."
+        }
+      ],
+      "diagnosis": "Review the logs for the 'WARN: Detected unhealthy error...' message. Analyze the specific error returned by your task function and the logic within your `CheckHealth` implementation.",
+      "resolution": "The `tasker` system will attempt to resolve this by replacing the unhealthy worker and re-queuing the task (if `MaxRetries > 0`). If this doesn't solve the issue, the problem might be external (e.g., database truly down) or in your `OnCreate` function (creating unhealthy resources).",
+      "prevention": "Ensure `CheckHealth` accurately reflects truly unhealthy states. Implement robust `OnCreate` functions to minimize the creation of faulty resources. Handle transient errors within tasks gracefully before returning them.",
+      "handlingPatterns": "This is an internal signal for `tasker`'s self-healing. The original caller might receive a `MaxRetriesExceededError` if the problem persists.",
+      "propagationBehavior": "This error is returned by the user's task function. `tasker` intercepts it, calls `CheckHealth`, and reacts. It might lead to worker replacement and task re-queuing, or eventually a `MaxRetriesExceededError` to the original caller."
+    },
+    "TaskProcessingError": {
+      "id": "error:TaskProcessingError",
+      "type": "error",
+      "symptoms": "`QueueTask`, `RunTask`, or `QueueTaskWithPriority` return an error that originated from the user-defined task function, and for which `CheckHealth` returned `true` (or `CheckHealth` is `nil`).",
+      "properties": "The specific error object returned by your task function (e.g., `errors.New(\"image_corrupted\")`, `fmt.Errorf(\"computation_error\")`).",
+      "scenarios": [
+        {
+          "trigger": "A task encounters a non-critical error, e.g., an input validation error, a file not found, or a minor business logic issue, for which the worker/resource is still considered healthy.",
+          "example": "manager.QueueTask(func(res *MyRes) (string, error) { return \"\", errors.New(\"invalid_input_data\") })",
+          "reason": "The task executed, but encountered an error specific to its operation, not indicative of a worker/resource failure."
+        }
+      ],
+      "diagnosis": "Examine the error returned directly by the task call. This indicates an issue with the specific task's data or logic.",
+      "resolution": "Handle the specific error within the calling code. This might involve retrying with different parameters, logging the invalid state, or informing the user.",
+      "prevention": "Implement robust validation and error handling within your task functions. Distinguish between task-specific errors and unhealthy resource errors by carefully designing your `CheckHealth` function.",
+      "handlingPatterns": "Catch the error and handle it based on its type or content. This is a common pattern for expected application-level errors.",
+      "propagationBehavior": "This error is returned directly to the caller of `QueueTask`, `RunTask`, or `QueueTaskWithPriority`."
+    }
+  }
+}

@@ -2,68 +2,105 @@
 
 ## Environment Requirements
 
-Go 1.22 or higher. The library leverages Go generics and specific atomic types introduced in recent Go versions. No specific operating system or hardware requirements beyond a standard Go development/runtime environment.
+To use Tasker, you need a Go development environment with Go version 1.24.3 or higher. Tasker itself is cross-platform, so it runs wherever Go is supported (Linux, Windows, macOS, etc.). No special compiler settings are required beyond standard Go build practices.
 
 ## Initialization Patterns
 
-### Standard initialization of a `tasker.Runner` instance. It involves defining resource creation/destruction functions and setting basic worker parameters. Always pair with `defer manager.Stop()` for graceful shutdown.
+### Standard initialization of Tasker with custom resource lifecycle functions and basic worker configuration. This pattern demonstrates the minimum required setup for a functional TaskManager.
 ```[DETECTED_LANGUAGE]
 package main
 
 import (
 	"context"
-	"fmt"
 	"log"
+	"time"
+
 	"github.com/asaidimu/tasker"
 )
 
-type MyCustomResource struct { ID int }
+// Define your custom resource type
+type DatabaseConnection struct { ID int }
 
-func createResource() (*MyCustomResource, error) {
-	fmt.Println("Creating MyCustomResource...")
-	return &MyCustomResource{ID: 123}, nil
+// onCreate: Function to create a new database connection
+func createDBConnection() (*DatabaseConnection, error) {
+	log.Println("INFO: Creating DatabaseConnection")
+	// Simulate connecting to a database
+	time.Sleep(10 * time.Millisecond)
+	return &DatabaseConnection{ID: 123}, nil
 }
 
-func destroyResource(res *MyCustomResource) error {
-	fmt.Printf("Destroying MyCustomResource %d.\n", res.ID)
+// onDestroy: Function to close the database connection
+func destroyDBConnection(conn *DatabaseConnection) error {
+	log.Printf("INFO: Destroying DatabaseConnection %d\n", conn.ID)
+	// Simulate closing the connection
 	return nil
 }
 
 func main() {
-	config := tasker.Config[*MyCustomResource]{
-		OnCreate: createResource,
-		OnDestroy: destroyResource,
-		WorkerCount: 3,
-		Ctx: context.Background(),
+	// Create a background context for the TaskManager
+	ctx := context.Background()
+
+	// Configure the TaskManager
+	config := tasker.Config[*DatabaseConnection]{
+		OnCreate:    createDBConnection,    // Required: function to create resource
+		OnDestroy:   destroyDBConnection,   // Required: function to destroy resource
+		WorkerCount: 5,                     // Required: number of base workers
+		Ctx:         ctx,                   // Required: parent context for lifecycle
+		// Optional fields:
+		// MaxWorkerCount: 10,
+		// BurstInterval: 100 * time.Millisecond,
+		// CheckHealth: func(err error) bool { return true },
+		// MaxRetries: 3,
+		// ResourcePoolSize: 5,
+		// Logger: &myCustomLogger{},
+		// Collector: &myCustomMetricsCollector{},
 	}
-	
-	manager, err := tasker.NewRunner[*MyCustomResource, string](config)
+
+	// Create a new TaskManager instance
+	manager, err := tasker.NewTaskManager[*DatabaseConnection, string](config) // Tasks will return string results
 	if err != nil {
-		log.Fatalf("Failed to initialize tasker: %v", err)
+		log.Fatalf("Failed to create TaskManager: %v", err)
 	}
-	defer manager.Stop() // Essential for graceful shutdown
-	
-	fmt.Println("Tasker manager initialized.")
-	// ... your application logic ...
+
+	// Ensure graceful shutdown when main exits
+	defer manager.Stop()
+
+	log.Println("TaskManager initialized and running. Add tasks here.")
+	// Example task (non-blocking for main)
+	go func() {
+		_, err := manager.QueueTask(func(db *DatabaseConnection) (string, error) {
+			log.Printf("Worker processing database query with connection %d\n", db.ID)
+			time.Sleep(50 * time.Millisecond)
+			return "Query result", nil
+		})
+		if err != nil { log.Printf("Task failed: %v\n", err) }
+		else { log.Println("Task completed.") }
+	}()
+
+	time.Sleep(200 * time.Millisecond) // Allow time for tasks
 }
+
 ```
 
 ## Common Integration Pitfalls
 
-- **Issue**: Not calling `manager.Stop()`
-  - **Solution**: Always ensure `manager.Stop()` is called when your application is shutting down, typically using `defer manager.Stop()` after `NewRunner` in `main` or a top-level goroutine.
+- **Issue**: Blocking operations in `OnCreate` or `OnDestroy`
+  - **Solution**: `OnCreate` and `OnDestroy` functions should be non-blocking and execute quickly. Blocking operations can delay worker startup/shutdown, leading to performance issues or graceful shutdown hangs. If an operation *must* block (e.g., waiting for an external service to become available on startup), consider handling it with timeouts or asynchronous initialization outside these functions where possible. Make sure `OnDestroy` never deadlocks or waits indefinitely.
 
-- **Issue**: Blocking or slow `OnCreate`/`OnDestroy` functions
-  - **Solution**: These functions are critical for worker startup/shutdown. Keep them fast and non-blocking. Offload any heavy initialization or cleanup to the tasks themselves if possible, or ensure external dependencies are highly available.
+- **Issue**: Task functions that do not respect context cancellation
+  - **Solution**: For long-running tasks, if you want them to be interruptible during `manager.Stop()` or `manager.Kill()`, your task function's internal logic needs to periodically check a `context.Context.Done()` channel and return if it's closed. Tasker itself doesn't directly pass a context to your `func(R) (E, error)`, so you must manage context propagation within your application (e.g., by capturing a context in a closure).
 
-- **Issue**: Premature `Config.Ctx` cancellation
-  - **Solution**: The context provided in `Config.Ctx` controls the entire `tasker` lifecycle. If it's cancelled early, the manager will shut down, rejecting new tasks. Ensure this context has the same lifecycle as your application's `tasker` usage.
+- **Issue**: Incorrect `CheckHealth` logic leading to worker thrashing
+  - **Solution**: If your `CheckHealth` function returns `false` for every task error (even transient ones), it can cause workers to be constantly replaced (`OnDestroy` then `OnCreate`), leading to high resource churn and degraded performance. Ensure `CheckHealth` returns `false` only for errors that truly indicate an unhealthy, unrecoverable worker or resource state, not for recoverable task-specific failures.
+
+- **Issue**: Queueing tasks after manager shutdown
+  - **Solution**: Attempting to call `QueueTask`, `RunTask`, etc., after `manager.Stop()` or `manager.Kill()` has been invoked will immediately return an error (`task manager is shutting down`). Ensure your application's task submission logic is aware of the TaskManager's lifecycle and ceases submissions during shutdown.
 
 ## Lifecycle Dependencies
 
-The `tasker.Runner` instance should be initialized during application startup using `NewRunner`. Its operational phase coincides with the application's active processing. During application shutdown, `manager.Stop()` must be called to ensure all worker goroutines complete their current tasks, resources are properly deallocated via `OnDestroy`, and internal channels are closed cleanly. The `Runner`'s lifecycle is directly managed by the `context.Context` provided in its `Config`.
+The Tasker's lifecycle is managed by the `context.Context` provided in `Config.Ctx`. When this context is cancelled (either explicitly by your application or implicitly by `manager.Stop()`/`manager.Kill()`), it signals all internal goroutines (workers, burst manager) to begin their shutdown procedures. Workers will call `OnDestroy` on their associated resources as they exit. The `NewTaskManager` function itself calls `OnCreate` to populate the initial `resourcePool` and for each base worker, so `OnCreate` must be ready before `NewTaskManager` is called.
 
 
 
 ---
-*Generated using Gemini AI on 6/14/2025, 1:47:53 PM. Review and refine as needed.*
+*Generated using Gemini AI on 6/30/2025, 4:52:27 PM. Review and refine as needed.*

@@ -1,0 +1,16 @@
+{
+  "name": "tasker",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "vitepress": "^1.6.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "scripts": {
+    "docs:dev": "vitepress dev www",
+    "docs:build": "vitepress build www",
+    "docs:preview": "vitepress preview www"
+  }
+}

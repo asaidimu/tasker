@@ -1,4 +1,12 @@
-# Integration Guide
+---
+outline: "deep"
+lastUpdated: true
+editLink: true
+sidebar: true
+title: "Integration Reference"
+description: "Documentation on integration aspects, requirements, and patterns"
+---
+# Integration
 
 ## Environment Requirements
 
@@ -6,11 +14,11 @@ Go **1.24.3** or higher is required for building and running applications using 
 
 ## Initialization Patterns
 
-### Basic TaskManager Initialization
+### The most common way to initialize `tasker` is by providing `OnCreate`, `OnDestroy`, `WorkerCount`, and a `context.Context`.
 
-The most common way to initialize `tasker` is by providing `OnCreate`, `OnDestroy`, `WorkerCount`, and a `context.Context`.
 
-```[DETECTED_LANGUAGE]
+
+```go
 package main
 
 import (
@@ -61,11 +69,12 @@ func main() {
 
 ```
 
-### Custom Logger and Metrics Integration
 
-Integrate custom logging and metrics collection by implementing the `tasker.Logger` and `tasker.MetricsCollector` interfaces.
+### Integrate custom logging and metrics collection by implementing the `tasker.Logger` and `tasker.MetricsCollector` interfaces.
 
-```[DETECTED_LANGUAGE]
+
+
+```go
 package main
 
 import (
@@ -128,22 +137,22 @@ func main() {
 
 ```
 
-## Common Integration Pitfalls
 
-- **Issue**: Not handling `context.Context` cancellation within task functions.
-  - **Solution**: Tasks should periodically check `ctx.Done()` or use `select { case <-ctx.Done(): return nil, ctx.Err() ... }` to respond to manager shutdowns or timeouts.
+## Common Pitfalls
 
-- **Issue**: Blocking indefinitely in `OnCreate`, `OnDestroy`, or task functions.
-  - **Solution**: Ensure these functions complete in a timely manner. Long-running initialization/cleanup should be handled asynchronously or outside `tasker`'s direct control if it risks blocking the pool.
+### Not handling `context.Context` cancellation within task functions.
 
-- **Issue**: Ignoring errors returned by `QueueTask` or `RunTask`.
-  - **Solution**: Always check the `error` return value to handle potential submission failures (e.g., manager shutting down) or task execution errors.
+**Solution**: Tasks should periodically check `ctx.Done()` or use `select { case <-ctx.Done(): return nil, ctx.Err() ... }` to respond to manager shutdowns or timeouts.
+
+### Blocking indefinitely in `OnCreate`, `OnDestroy`, or task functions.
+
+**Solution**: Ensure these functions complete in a timely manner. Long-running initialization/cleanup should be handled asynchronously or outside `tasker`'s direct control if it risks blocking the pool.
+
+### Ignoring errors returned by `QueueTask` or `RunTask`.
+
+**Solution**: Always check the `error` return value to handle potential submission failures (e.g., manager shutting down) or task execution errors.
 
 ## Lifecycle Dependencies
 
 The `TaskManager` relies on a parent `context.Context` for its overall lifecycle. Cancelling this context (passed via `Config.Ctx`) initiates a graceful shutdown (`Stop()` behavior). Users must ensure the `TaskManager`'s `Stop()` or `Kill()` method is called when the application exits to properly release resources and wait for tasks (for `Stop()`). Resource creation (`OnCreate`) and destruction (`OnDestroy`) are directly tied to worker lifecycles and the `RunTask` operation. Workers will not start if `OnCreate` fails, and resources are destroyed when workers exit or the manager shuts down.
 
-
-
----
-*Generated using Gemini AI on 6/30/2025, 9:35:09 PM. Review and refine as needed.*

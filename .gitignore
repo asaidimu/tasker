@@ -23,3 +23,6 @@ go.work
 *.log
 .commit-message.md
 .readme.md
+www/.vitepress/cache
+www/.vitepress/dist
+node_modules

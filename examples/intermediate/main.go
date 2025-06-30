@@ -8,7 +8,7 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/asaidimu/tasker"
+	"github.com/asaidimu/tasker/v2"
 )
 
 // ImageProcessor represents a resource for image manipulation.
@@ -64,7 +64,7 @@ func main() {
 	// --- 1. Queue a normal image resize task ---
 	fmt.Println("\nQueueing a normal image resize task...")
 	go func() {
-		result, err := manager.QueueTask(func(proc *ImageProcessor) (string, error) {
+		result, err := manager.QueueTask(func(ctx context.Context, proc *ImageProcessor) (string, error) {
 			fmt.Printf("Worker %d processing normal resize for imageA.jpg\n", proc.ID)
 			time.Sleep(150 * time.Millisecond)
 			if rand.Intn(10) < 3 { // Simulate a healthy but non-fatal processing error 30% of the time
@@ -82,7 +82,7 @@ func main() {
 	// --- 2. Queue a high-priority thumbnail generation task ---
 	fmt.Println("Queueing a high-priority thumbnail task...")
 	go func() {
-		result, err := manager.QueueTaskWithPriority(func(proc *ImageProcessor) (string, error) {
+		result, err := manager.QueueTaskWithPriority(func(ctx context.Context, proc *ImageProcessor) (string, error) {
 			fmt.Printf("Worker %d processing HIGH PRIORITY thumbnail for video.mp4\n", proc.ID)
 			time.Sleep(50 * time.Millisecond) // Faster processing
 			return "video_thumbnail.jpg", nil
@@ -97,7 +97,7 @@ func main() {
 	// --- 3. Simulate a task that causes an "unhealthy" error ---
 	fmt.Println("Queueing a task that might crash a worker (unhealthy error)...")
 	go func() {
-		result, err := manager.QueueTask(func(proc *ImageProcessor) (string, error) {
+		result, err := manager.QueueTask(func(ctx context.Context, proc *ImageProcessor) (string, error) {
 			fmt.Printf("Worker %d processing problematic image (might crash)\n", proc.ID)
 			time.Sleep(100 * time.Millisecond)
 			if rand.Intn(2) == 0 { // 50% chance to simulate a crash
@@ -114,7 +114,7 @@ func main() {
 
 	// --- 4. Run an immediate task (e.g., generate a preview for a user) ---
 	fmt.Println("\nRunning an immediate task (using resource pool or temporary resource)...")
-	immediateResult, immediateErr := manager.RunTask(func(proc *ImageProcessor) (string, error) {
+	immediateResult, immediateErr := manager.RunTask(func(ctx context.Context, proc *ImageProcessor) (string, error) {
 		fmt.Printf("IMMEDIATE Task processing fast preview with processor %d\n", proc.ID)
 		time.Sleep(20 * time.Millisecond)
 		return "fast_preview.jpg", nil

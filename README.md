@@ -52,7 +52,7 @@ This library is particularly useful for applications that:
 To add `tasker` to your Go project, use `go get`:
 
 ```bash
-go get github.com/asaidimu/tasker
+go get github.com/asaidimu/tasker/v2
 ```
 
 ### Verification
@@ -111,7 +111,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/asaidimu/tasker"
+	"github.com/asaidimu/tasker/v2"
 )
 
 // CalculatorResource represents a simple resource,

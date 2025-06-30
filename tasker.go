@@ -32,7 +32,19 @@ type TaskManager[R any, E any] interface {
 	// The task will be picked up by an available worker.
 	// It returns the result and error of the task once it completes.
 	// If the task manager is shutting down, it returns an error immediately.
-	QueueTask(task func(R) (E, error)) (E, error)
+	QueueTask(task func(context.Context, R) (E, error)) (E, error)
+
+	// QueueTaskWithCallback adds a task to the main queue for asynchronous execution.
+	// The callback function will be invoked with the task's result and error once it completes.
+	// This method returns immediately and does not block.
+	// If the task manager is shutting down, the callback will be invoked with an error.
+	QueueTaskWithCallback(task func(context.Context, R) (E, error), callback func(E, error))
+
+	// QueueTaskAsync adds a task to the main queue for asynchronous execution.
+	// It returns a channel that will receive the task's result and error once it completes.
+	// The caller can then read from this channel to get the result without blocking the submission.
+	// If the task manager is shutting down, it returns an error immediately and a closed channel.
+	QueueTaskAsync(task func(context.Context, R) (E, error)) (<-chan E, <-chan error)
 
 	// RunTask executes a task immediately, bypassing the main and priority queues.
 	// It attempts to acquire a resource from the internal pool. If no resource
@@ -40,13 +52,25 @@ type TaskManager[R any, E any] interface {
 	// This method is suitable for urgent tasks that should not be delayed by queueing.
 	// It returns the result and error of the task.
 	// If the task manager is shutting down, it returns an error immediately.
-	RunTask(task func(R) (E, error)) (E, error)
+	RunTask(task func(context.Context, R) (E, error)) (E, error)
 
 	// QueueTaskWithPriority adds a high priority task to a dedicated queue.
 	// Tasks in the priority queue are processed before tasks in the main queue.
 	// It returns the result and error of the task once it completes.
 	// If the task manager is shutting down, it returns an error immediately.
-	QueueTaskWithPriority(task func(R) (E, error)) (E, error)
+	QueueTaskWithPriority(task func(context.Context, R) (E, error)) (E, error)
+
+	// QueueTaskWithPriorityWithCallback adds a high priority task to a dedicated queue for asynchronous execution.
+	// The callback function will be invoked with the task's result and error once it completes.
+	// This method returns immediately and does not block.
+	// If the task manager is shutting down, the callback will be invoked with an error.
+	QueueTaskWithPriorityWithCallback(task func(context.Context, R) (E, error), callback func(E, error))
+
+	// QueueTaskWithPriorityAsync adds a high priority task to a dedicated queue for asynchronous execution.
+	// It returns a channel that will receive the task's result and error once it completes.
+	// The caller can then read from this channel to get the result without blocking the submission.
+	// If the task manager is shutting down, it returns an error immediately and a closed channel.
+	QueueTaskWithPriorityAsync(task func(context.Context, R) (E, error)) (<-chan E, <-chan error)
 
 	// QueueTaskOnce adds a task to the main queue for asynchronous execution.
 	// This task will NOT be re-queued by the task manager's internal retry mechanism
@@ -55,7 +79,27 @@ type TaskManager[R any, E any] interface {
 	// from the task manager's perspective.
 	// It returns the result and error of the task once it completes.
 	// If the task manager is shutting down, it returns an error immediately.
-	QueueTaskOnce(task func(R) (E, error)) (E, error)
+	QueueTaskOnce(task func(context.Context, R) (E, error)) (E, error)
+
+	// QueueTaskOnceWithCallback adds a task to the main queue for asynchronous execution.
+	// This task will NOT be re-queued by the task manager's internal retry mechanism
+	// if it fails and CheckHealth indicates an unhealthy state. This is suitable
+	// for non-idempotent operations where "at-most-once" execution is desired
+	// from the task manager's perspective.
+	// The callback function will be invoked with the task's result and error once it completes.
+	// This method returns immediately and does not block.
+	// If the task manager is shutting down, the callback will be invoked with an error.
+	QueueTaskOnceWithCallback(task func(context.Context, R) (E, error), callback func(E, error))
+
+	// QueueTaskOnceAsync adds a task to the main queue for asynchronous execution.
+	// This task will NOT be re-queued by the task manager's internal retry mechanism
+	// if it fails and CheckHealth indicates an unhealthy state. This is suitable
+	// for non-idempotent operations where "at-most-once" execution is desired
+	// from the task manager's perspective.
+	// It returns a channel that will receive the task's result and error once it completes.
+	// The caller can then read from this channel to get the result without blocking the submission.
+	// If the task manager is shutting down, it returns an error immediately and a closed channel.
+	QueueTaskOnceAsync(task func(context.Context, R) (E, error)) (<-chan E, <-chan error)
 
 	// QueueTaskWithPriorityOnce adds a high priority task to a dedicated queue.
 	// This task will NOT be re-queued by the task manager's internal retry mechanism
@@ -64,7 +108,27 @@ type TaskManager[R any, E any] interface {
 	// is desired from the task manager's perspective.
 	// It returns the result and error of the task once it completes.
 	// If the task manager is shutting down, it returns an error immediately.
-	QueueTaskWithPriorityOnce(task func(R) (E, error)) (E, error)
+	QueueTaskWithPriorityOnce(task func(context.Context, R) (E, error)) (E, error)
+
+	// QueueTaskWithPriorityOnceWithCallback adds a high priority task to a dedicated queue for asynchronous execution.
+	// This task will NOT be re-queued by the task manager's internal retry mechanism
+	// if it fails and CheckHealth indicates an unhealthy state. This is suitable
+	// for non-idempotent high-priority operations where "at-most-once" execution
+	// is desired from the task manager's perspective.
+	// The callback function will be invoked with the task's result and error once it completes.
+	// This method returns immediately and does not block.
+	// If the task manager is shutting down, the callback will be invoked with an error.
+	QueueTaskWithPriorityOnceWithCallback(task func(context.Context, R) (E, error), callback func(E, error))
+
+	// QueueTaskWithPriorityOnceAsync adds a high priority task to a dedicated queue for asynchronous execution.
+	// This task will NOT be re-queued by the task manager's internal retry mechanism
+	// if it fails and CheckHealth indicates an unhealthy state. This is suitable
+	// for non-idempotent high-priority operations where "at-most-once" execution
+	// is desired from the task manager's perspective.
+	// It returns a channel that will receive the task's result and error once it completes.
+	// The caller can then read from this channel to get the result without blocking the submission.
+	// If the task manager is shutting down, it returns an error immediately and a closed channel.
+	QueueTaskWithPriorityOnceAsync(task func(context.Context, R) (E, error)) (<-chan E, <-chan error)
 
 	// Stop gracefully shuts down the task manager.
 	// It stops accepting new tasks, waits for all queued tasks to be completed,
@@ -99,8 +163,8 @@ type TaskStats struct {
 // and a retry counter for handling transient failures.
 type Task[R any, E any] struct {
 	// The actual function representing the task's logic.
-	// R is the resource type itself (e.g., *DatabaseConnection).
-	run      func(R) (E, error)
+	// It now accepts a context.Context for cancellation and a resource of type R.
+	run      func(context.Context, R) (E, error)
 	result   chan E     // Channel to send the task's successful result.
 	err      chan error // Channel to send any error encountered during task execution.
 	retries  int        // Current number of retries attempted for this task.
@@ -478,7 +542,12 @@ func (r *Manager[R, E]) processQueues(resource R) bool {
 func (r *Manager[R, E]) executeTask(task *Task[R, E], resource R) bool {
 	startedAt := time.Now()
 	r.logger.Debugf("Executing task (retries: %d).", task.retries)
-	result, err := task.run(resource)
+	// Create a context for the task, derived from the manager's root context.
+	// This allows individual tasks to be cancelled via the manager's Stop/Kill methods.
+	taskCtx, cancel := context.WithCancel(r.ctx)
+	defer cancel()
+
+	result, err := task.run(taskCtx, resource)
 	finishedAt := time.Now()
 
 	timestamps := TaskLifecycleTimestamps{
@@ -541,7 +610,7 @@ func (r *Manager[R, E]) sendTaskResult(task *Task[R, E], result E, err error) {
 }
 
 // QueueTask adds a task to the main queue for asynchronous processing.
-func (r *Manager[R, E]) QueueTask(taskFunc func(R) (E, error)) (E, error) {
+func (r *Manager[R, E]) QueueTask(taskFunc func(context.Context, R) (E, error)) (E, error) {
 	if !r.isRunning() {
 		var zero E
 		r.logger.Warnf("Attempted to queue task while shutting down.")
@@ -568,13 +637,50 @@ func (r *Manager[R, E]) QueueTask(taskFunc func(R) (E, error)) (E, error) {
 	}
 }
 
+// QueueTaskWithCallback adds a task to the main queue for asynchronous execution.
+// The callback function will be invoked with the task's result and error once it completes.
+// This method returns immediately and does not block.
+// If the task manager is shutting down, the callback will be invoked with an error.
+func (r *Manager[R, E]) QueueTaskWithCallback(taskFunc func(context.Context, R) (E, error), callback func(E, error)) {
+	go func() {
+		var zero E
+		if !r.isRunning() {
+			callback(zero, errors.New("task manager is shutting down"))
+			return
+		}
+		result, err := r.QueueTask(taskFunc)
+		callback(result, err)
+	}()
+}
+
+// QueueTaskAsync adds a task to the main queue for asynchronous execution.
+// It returns a channel that will receive the task's result and error once it completes.
+// The caller can then read from this channel to get the result without blocking the submission.
+// If the task manager is shutting down, it returns an error immediately and a closed channel.
+
+func (r *Manager[R, E]) QueueTaskAsync(taskFunc func(context.Context, R) (E, error)) (<-chan E, <-chan error) {
+	resultChan := make(chan E, 1)
+	errorChan := make(chan error, 1)
+
+	go func() {
+		defer close(resultChan)
+		defer close(errorChan)
+
+		result, err := r.QueueTask(taskFunc)
+		resultChan <- result
+		errorChan <- err
+	}()
+
+	return resultChan, errorChan
+}
+
 // QueTaskOnce adds a task to the main queue that will NOT be retried
 // by the task manager's internal retry mechanism if it fails and
 // CheckHealth indicates an unhealthy state. This is suitable for
 // non-idempotent operations.
 // It returns the result and error of the task once it completes.
 // If the task manager is shutting down, it returns an error immediately.
-func (r *Manager[R, E]) QueueTaskOnce(taskFunc func(R) (E, error)) (E, error) {
+func (r *Manager[R, E]) QueueTaskOnce(taskFunc func(context.Context, R) (E, error)) (E, error) {
 	if !r.isRunning() {
 		var zero E
 		r.logger.Warnf("Attempted to queue a 'once' task while shutting down.")
@@ -602,8 +708,52 @@ func (r *Manager[R, E]) QueueTaskOnce(taskFunc func(R) (E, error)) (E, error) {
 	}
 }
 
+// QueueTaskOnceWithCallback adds a task to the main queue for asynchronous execution.
+// This task will NOT be re-queued by the task manager's internal retry mechanism
+// if it fails and CheckHealth indicates an unhealthy state. This is suitable
+// for non-idempotent operations where "at-most-once" execution is desired
+// from the task manager's perspective.
+// The callback function will be invoked with the task's result and error once it completes.
+// This method returns immediately and does not block.
+// If the task manager is shutting down, the callback will be invoked with an error.
+func (r *Manager[R, E]) QueueTaskOnceWithCallback(taskFunc func(context.Context, R) (E, error), callback func(E, error)) {
+	go func() {
+		var zero E
+		if !r.isRunning() {
+			callback(zero, errors.New("task manager is shutting down"))
+			return
+		}
+		result, err := r.QueueTaskOnce(taskFunc)
+		callback(result, err)
+	}()
+}
+
+// QueueTaskOnceAsync adds a task to the main queue for asynchronous execution.
+// This task will NOT be re-queued by the task manager's internal retry mechanism
+// if it fails and CheckHealth indicates an unhealthy state. This is suitable
+// for non-idempotent operations where "at-most-once" execution is desired
+// from the task manager's perspective.
+// It returns a channel that will receive the task's result and error once it completes.
+// The caller can then read from this channel to get the result without blocking the submission.
+// If the task manager is shutting down, it returns an error immediately and a closed channel.
+func (r *Manager[R, E]) QueueTaskOnceAsync(taskFunc func(context.Context, R) (E, error)) (<-chan E, <-chan error) {
+	resultChan := make(chan E, 1)
+	errorChan := make(chan error, 1)
+
+	go func() {
+		defer close(resultChan)
+		defer close(errorChan)
+
+		result, err := r.QueueTaskOnce(taskFunc)
+		resultChan <- result
+		errorChan <- err
+	}()
+
+	return resultChan, errorChan
+}
+
 // QueueTaskWithPriority adds a high-priority task to the priority queue.
-func (r *Manager[R, E]) QueueTaskWithPriority(taskFunc func(R) (E, error)) (E, error) {
+func (r *Manager[R, E]) QueueTaskWithPriority(taskFunc func(context.Context, R) (E, error)) (E, error) {
 	if !r.isRunning() {
 		var zero E
 		r.logger.Warnf("Attempted to queue priority task while shutting down.")
@@ -630,9 +780,45 @@ func (r *Manager[R, E]) QueueTaskWithPriority(taskFunc func(R) (E, error)) (E, e
 	}
 }
 
+// QueueTaskWithPriorityWithCallback adds a high priority task to a dedicated queue for asynchronous execution.
+// The callback function will be invoked with the task's result and error once it completes.
+// This method returns immediately and does not block.
+// If the task manager is shutting down, the callback will be invoked with an error.
+func (r *Manager[R, E]) QueueTaskWithPriorityWithCallback(taskFunc func(context.Context, R) (E, error), callback func(E, error)) {
+	go func() {
+		var zero E
+		if !r.isRunning() {
+			callback(zero, errors.New("task manager is shutting down"))
+			return
+		}
+		result, err := r.QueueTaskWithPriority(taskFunc)
+		callback(result, err)
+	}()
+}
+
+// QueueTaskWithPriorityAsync adds a high priority task to a dedicated queue for asynchronous execution.
+// It returns a channel that will receive the task's result and error once it completes.
+// The caller can then read from this channel to get the result without blocking the submission.
+// If the task manager is shutting down, it returns an error immediately and a closed channel.
+func (r *Manager[R, E]) QueueTaskWithPriorityAsync(taskFunc func(context.Context, R) (E, error)) (<-chan E, <-chan error) {
+	resultChan := make(chan E, 1)
+	errorChan := make(chan error, 1)
+
+	go func() {
+		defer close(resultChan)
+		defer close(errorChan)
+
+		result, err := r.QueueTaskWithPriority(taskFunc)
+		resultChan <- result
+		errorChan <- err
+	}()
+
+	return resultChan, errorChan
+}
+
 // QueueTaskWithPriority adds a high-priority task to the priority queue, but
 // the task will not be retried.
-func (r *Manager[R, E]) QueueTaskWithPriorityOnce(taskFunc func(R) (E, error)) (E, error) {
+func (r *Manager[R, E]) QueueTaskWithPriorityOnce(taskFunc func(context.Context, R) (E, error)) (E, error) {
 	if !r.isRunning() {
 		var zero E
 		r.logger.Warnf("Attempted to queue a 'once' priority task while shutting down.")
@@ -660,8 +846,52 @@ func (r *Manager[R, E]) QueueTaskWithPriorityOnce(taskFunc func(R) (E, error)) (
 	}
 }
 
+// QueueTaskWithPriorityOnceWithCallback adds a high priority task to a dedicated queue for asynchronous execution.
+// This task will NOT be re-queued by the task manager's internal retry mechanism
+// if it fails and CheckHealth indicates an unhealthy state. This is suitable
+// for non-idempotent high-priority operations where "at-most-once" execution
+// is desired from the task manager's perspective.
+// The callback function will be invoked with the task's result and error once it completes.
+// This method returns immediately and does not block.
+// If the task manager is shutting down, the callback will be invoked with an error.
+func (r *Manager[R, E]) QueueTaskWithPriorityOnceWithCallback(taskFunc func(context.Context, R) (E, error), callback func(E, error)) {
+	go func() {
+		var zero E
+		if !r.isRunning() {
+			callback(zero, errors.New("task manager is shutting down"))
+			return
+		}
+		result, err := r.QueueTaskWithPriorityOnce(taskFunc)
+		callback(result, err)
+	}()
+}
+
+// QueueTaskWithPriorityOnceAsync adds a high priority task to a dedicated queue for asynchronous execution.
+// This task will NOT be re-queued by the task manager's internal retry mechanism
+// if it fails and CheckHealth indicates an unhealthy state. This is suitable
+// for non-idempotent high-priority operations where "at-most-once" execution
+// is desired from the task manager's perspective.
+// It returns a channel that will receive the task's result and error once it completes.
+// The caller can then read from this channel to get the result without blocking the submission.
+// If the task manager is shutting down, it returns an error immediately and a closed channel.
+func (r *Manager[R, E]) QueueTaskWithPriorityOnceAsync(taskFunc func(context.Context, R) (E, error)) (<-chan E, <-chan error) {
+	resultChan := make(chan E, 1)
+	errorChan := make(chan error, 1)
+
+	go func() {
+		defer close(resultChan)
+		defer close(errorChan)
+
+		result, err := r.QueueTaskWithPriorityOnce(taskFunc)
+		resultChan <- result
+		errorChan <- err
+	}()
+
+	return resultChan, errorChan
+}
+
 // RunTask executes a task immediately using a resource from the pool.
-func (r *Manager[R, E]) RunTask(taskFunc func(R) (E, error)) (E, error) {
+func (r *Manager[R, E]) RunTask(taskFunc func(context.Context, R) (E, error)) (E, error) {
 	if !r.isRunning() {
 		var zero E
 		r.logger.Warnf("Attempted to run task while shutting down.")
@@ -720,7 +950,8 @@ func (r *Manager[R, E]) RunTask(taskFunc func(R) (E, error)) (E, error) {
 	}()
 
 	r.logger.Debugf("Executing RunTask.")
-	result, err := taskFunc(resource)
+	// For RunTask, we use the manager's root context directly.
+	result, err := taskFunc(r.ctx, resource)
 	finishedAt := time.Now()
 
 	timestamps := TaskLifecycleTimestamps{

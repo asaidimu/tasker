@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/asaidimu/tasker"
+	"github.com/asaidimu/tasker/v2"
 )
 
 // HeavyComputeResource represents a resource for intensive computations.
@@ -67,7 +67,7 @@ func main() {
 		taskID := i
 		tasksSubmitted.Add(1)
 		go func() {
-			result, err := manager.QueueTask(func(res *HeavyComputeResource) (string, error) {
+			result, err := manager.QueueTask(func(ctx context.Context, res *HeavyComputeResource) (string, error) {
 				processingTime := time.Duration(100 + rand.Intn(300)) * time.Millisecond // 100-400ms work
 				fmt.Printf("Worker %d processing Task %d for %s\n", res.ID, taskID, processingTime)
 				time.Sleep(processingTime)
@@ -112,7 +112,7 @@ func main() {
 	fmt.Println("\nQueueing a high priority task during active bursting...")
 	go func() {
 		tasksSubmitted.Add(1)
-		result, err := manager.QueueTaskWithPriority(func(res *HeavyComputeResource) (string, error) {
+		result, err := manager.QueueTaskWithPriority(func(ctx context.Context, res *HeavyComputeResource) (string, error) {
 			fmt.Printf("Worker %d processing HIGH PRIORITY urgent report!\n", res.ID)
 			time.Sleep(50 * time.Millisecond)
 			return "Urgent report generated!", nil

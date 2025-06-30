@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/asaidimu/tasker"
+	"github.com/asaidimu/tasker/v2"
 )
 
 // CalculatorResource represents a simple resource,
@@ -46,42 +46,61 @@ func main() {
 	}
 	defer manager.Stop() // Ensure the manager is stopped gracefully
 
-	fmt.Println("Queuing a simple addition task...")
+	fmt.Println("Queuing a simple Multiplication task...")
 	task1Start := time.Now()
 	// Queue a task to perform addition
 	go func() {
-		sum, err := manager.QueueTask(func(r *CalculatorResource) (int, error) {
+		sum, err := manager.QueueTask(func(ctx context.Context, r *CalculatorResource) (int, error) {
 			// In a real scenario, 'r' could be a connection to a math service
 			time.Sleep(50 * time.Millisecond) // Simulate some work
 			a, b := 10, 25
 			fmt.Printf("Worker processing: %d + %d\n", a, b)
-			return a + b, nil
+			return a * b, nil
 		})
 
 		if err != nil {
 			fmt.Printf("Task 1 failed: %v\n", err)
 		} else {
-			fmt.Printf("Task 1 (Addition) Result: %d (took %s)\n", sum, time.Since(task1Start))
+			fmt.Printf("Task 1 (Multiplication) Result: %d (took %s)\n", sum, time.Since(task1Start))
 		}
 	}()
+
+	fmt.Println("Queuing another addition task...")
+	task2Start := time.Now()
+	manager.QueueTaskWithCallback(
+		func(ctx context.Context, r *CalculatorResource) (int, error) {
+			time.Sleep(50 * time.Millisecond) // Simulate some work
+			a, b := 10, 25
+			fmt.Printf("Worker processing: %d + %d\n", a, b)
+			return a + b, nil
+		},
+		func(sum int, err error) { // do something with the results
+			if err != nil {
+				fmt.Printf("Task 2 failed: %v\n", err)
+			} else {
+				fmt.Printf("Task 2 (Addition) Result: %d (took %s)\n", sum, time.Since(task2Start))
+			}
+		},
+	)
 
 	fmt.Println("Queuing another subtraction task...")
-	task2Start := time.Now()
-	// Queue another task for subtraction
-	go func() {
-		difference, err := manager.QueueTask(func(r *CalculatorResource) (int, error) {
-			time.Sleep(70 * time.Millisecond) // Simulate some work
-			a, b := 100, 40
-			fmt.Printf("Worker processing: %d - %d\n", a, b)
-			return a - b, nil
-		})
 
-		if err != nil {
-			fmt.Printf("Task 2 failed: %v\n", err)
-		} else {
-			fmt.Printf("Task 2 (Subtraction) Result: %d (took %s)\n", difference, time.Since(task2Start))
-		}
-	}()
+	task3Start := time.Now()
+	differencech, errch := manager.QueueTaskAsync(func(ctx context.Context, r *CalculatorResource) (int, error) {
+		time.Sleep(70 * time.Millisecond) // Simulate some work
+		a, b := 100, 40
+		fmt.Printf("Worker processing: %d - %d\n", a, b)
+		return a - b, nil
+	})
+
+	difference := <-differencech
+	err = <-errch
+
+	if err != nil {
+		fmt.Printf("Task 3 failed: %v\n", err)
+	} else {
+		fmt.Printf("Task 3 (Subtraction) Result: %d (took %s)\n", difference, time.Since(task3Start))
+	}
 
 	// Allow some time for tasks to complete
 	time.Sleep(500 * time.Millisecond)

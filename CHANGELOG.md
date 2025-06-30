@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/asaidimu/tasker/compare/v1.1.0...v1.2.0) (2025-06-30)
+
+
+### Features
+
+* **manager:** introduce comprehensive metrics, logging, and rate-based scaling ([1d6a918](https://github.com/asaidimu/tasker/commit/1d6a91843268dbb99e38013e0ea2a795a0b82075))
+
 # [1.1.0](https://github.com/asaidimu/tasker/compare/v1.0.0...v1.1.0) (2025-06-30)
 
 

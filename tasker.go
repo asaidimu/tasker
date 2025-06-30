@@ -76,9 +76,9 @@ type Task[R any, E any] struct {
 	// The actual function representing the task's logic.
 	// R is the resource type itself (e.g., *DatabaseConnection).
 	run     func(R) (E, error)
-	result  chan E    // Channel to send the task's successful result.
+	result  chan E      // Channel to send the task's successful result.
 	err     chan error  // Channel to send any error encountered during task execution.
-	retries int     // Current number of retries attempted for this task.
+	retries int         // Current number of retries attempted for this task.
 }
 
 // Config holds configuration parameters for creating a new Runner instance.
@@ -153,13 +153,13 @@ type Runner[R any, E any] struct {
 	maxRetries  int               // Maximum number of retries for a task on unhealthy errors.
 
 	// Worker management
-	baseWorkerCount int32       // The fixed number of base workers.
-	activeWorkers   atomic.Int32  // Atomically counts all currently active workers (base + burst).
-	burstWorkers    atomic.Int32  // Atomically counts currently active burst workers.
+	baseWorkerCount     int32           // The fixed number of base workers.
+	activeWorkers       atomic.Int32    // Atomically counts all currently active workers (base + burst).
+	burstWorkers        atomic.Int32    // Atomically counts currently active burst workers.
 	burstTaskThreshold  int
-	burstWorkerCount      int
-	maxWorkerCount  int           // Maximum total workers allowed.
-	burstInterval   time.Duration // Interval for burst manager to check queues.
+	burstWorkerCount    int
+	maxWorkerCount      int             // Maximum total workers allowed.
+	burstInterval       time.Duration   // Interval for burst manager to check queues.
 
 	// Task queues (using channels for efficient communication)
 	mainQueue     chan *Task[R, E] // Main queue for standard tasks.
@@ -180,8 +180,10 @@ type Runner[R any, E any] struct {
 	burstTicker *time.Ticker           // Ticker for the burst manager's periodic checks.
 	burstStop   chan struct{}          // Signal channel to stop the burst manager goroutine.
 
-	// Statistics
-	stats atomic.Pointer[TaskStats] // Atomically holds a pointer to the TaskStats struct for safe concurrent reads/updates.
+	// Statistics - using individual atomic values for better performance
+	queuedTasks        atomic.Int32 // Number of tasks currently in the main queue.
+	priorityTasks      atomic.Int32 // Number of tasks currently in the priority queue.
+	availableResources atomic.Int32 // Number of resources currently available in the resource pool.
 }
 
 // NewRunner creates and initializes a new Runner instance based on the provided configuration.
@@ -226,15 +228,15 @@ func NewRunner[R any, E any](config Config[R]) (TaskManager[R, E], error) {
 	ctx, cancel := context.WithCancel(config.Ctx)
 
 	runner := &Runner[R, E]{
-		onCreate:        config.OnCreate,
-		onDestroy:       config.OnDestroy,
-		baseWorkerCount: int32(config.WorkerCount),
-		checkHealth:     config.CheckHealth,
-		maxRetries:      config.MaxRetries,
+		onCreate:            config.OnCreate,
+		onDestroy:           config.OnDestroy,
+		baseWorkerCount:     int32(config.WorkerCount),
+		checkHealth:         config.CheckHealth,
+		maxRetries:          config.MaxRetries,
 		burstTaskThreshold:  config.BurstTaskThreshold,
-		burstWorkerCount:      config.BurstWorkerCount,
-		maxWorkerCount:  config.MaxWorkerCount,
-		burstInterval:   config.BurstInterval,
+		burstWorkerCount:    config.BurstWorkerCount,
+		maxWorkerCount:      config.MaxWorkerCount,
+		burstInterval:       config.BurstInterval,
 
 		// Buffered channels to prevent blocking on send when queues are not full
 		// and to allow for concurrent producers/consumers.
@@ -249,10 +251,10 @@ func NewRunner[R any, E any](config Config[R]) (TaskManager[R, E], error) {
 		burstCtxs: make([]context.CancelFunc, 0), // Initialize an empty slice for burst worker contexts.
 	}
 
-	// Initialize the stats atomic pointer with initial base worker count.
-	runner.stats.Store(&TaskStats{
-		BaseWorkers: int32(config.WorkerCount),
-	})
+	// Initialize atomic counters
+	runner.availableResources.Store(0)
+	runner.queuedTasks.Store(0)
+	runner.priorityTasks.Store(0)
 
 	// Initialize resource pool before starting workers to ensure resources are available.
 	if err := runner.initializeResourcePool(); err != nil {
@@ -287,15 +289,16 @@ func (r *Runner[R, E]) initializeResourcePool() error {
 		select {
 		case r.resourcePool <- resource:
 			// Resource added to pool.
+			r.availableResources.Add(1)
 		case <-r.ctx.Done():
 			// Context cancelled during initialization, destroy resource and exit.
-			r.onDestroy(resource) // onDestroy now accepts R directly
+			if destroyErr := r.onDestroy(resource); destroyErr != nil {
+				// Log error but continue cleanup
+			}
 			r.drainResourcePool() // Ensure any others are drained
 			return r.ctx.Err()
 		}
 	}
-	// Update available resources in stats.
-	r.updateStats(func(s *TaskStats) { s.AvailableResources = int32(r.poolSize) })
 	return nil
 }
 
@@ -305,12 +308,12 @@ func (r *Runner[R, E]) drainResourcePool() {
 	for {
 		select {
 		case resource := <-r.resourcePool: // resource is of type R
-			// Attempt to destroy each resource. Log errors but continue draining.
-			if err := r.onDestroy(resource); err != nil { // onDestroy now accepts R directly
+			// Attempt to destroy each resource. Continue draining even on errors.
+			if err := r.onDestroy(resource); err != nil {
 				// In a production application, you might log this error with a logger.
-				// log.Printf("ERROR: Failed to destroy resource during drain: %v", err)
+				// For now, we continue cleanup to prevent resource leaks
 			}
-			r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.AvailableResources, -1) })
+			r.availableResources.Add(-1)
 		default:
 			// No more resources in the pool.
 			return
@@ -338,18 +341,21 @@ func (r *Runner[R, E]) worker(ctx context.Context, isBurst bool) {
 	if err != nil {
 		// Log error if resource creation fails and exit worker.
 		// In a production app, use a proper logger.
-		// log.Printf("ERROR: Worker failed to create resource: %v", err)
 		return
 	}
-	defer r.onDestroy(resource) // Ensure resource is destroyed when worker exits. onDestroy accepts R directly
+	defer func() {
+		if destroyErr := r.onDestroy(resource); destroyErr != nil {
+			// Handle cleanup errors appropriately in production
+		}
+	}()
 
 	// Update worker counters.
 	if isBurst {
-		r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.BurstWorkers, 1) })
-		defer r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.BurstWorkers, -1) })
+		r.burstWorkers.Add(1)
+		defer r.burstWorkers.Add(-1)
 	}
-	r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.ActiveWorkers, 1) })
-	defer r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.ActiveWorkers, -1) })
+	r.activeWorkers.Add(1)
+	defer r.activeWorkers.Add(-1)
 
 	for {
 		select {
@@ -358,14 +364,14 @@ func (r *Runner[R, E]) worker(ctx context.Context, isBurst bool) {
 			return
 		case task := <-r.priorityQueue:
 			// Process high priority tasks first.
-			r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.PriorityTasks, -1) }) // Decrement count immediately.
+			r.priorityTasks.Add(-1) // Decrement count immediately.
 			if !r.executeTask(task, resource) {
 				// Worker is unhealthy or task failed beyond retries, exit worker.
 				return
 			}
 		case task := <-r.mainQueue:
 			// Process regular tasks if no priority tasks are available.
-			r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.QueuedTasks, -1) }) // Decrement count immediately.
+			r.queuedTasks.Add(-1) // Decrement count immediately.
 			if !r.executeTask(task, resource) {
 				// Worker is unhealthy or task failed beyond retries, exit worker.
 				return
@@ -377,7 +383,7 @@ func (r *Runner[R, E]) worker(ctx context.Context, isBurst bool) {
 // executeTask runs a task, handles its result, error, and retry logic.
 // It returns `true` if the worker remains healthy and can continue processing tasks,
 // and `false` if the worker should exit (e.g., due to an unhealthy resource).
-func (r *Runner[R, E]) executeTask(task *Task[R, E], resource R) bool { // resource is now R directly
+func (r *Runner[R, E]) executeTask(task *Task[R, E], resource R) bool {
 	result, err := task.run(resource) // Execute the task function.
 
 	if err != nil && !r.checkHealth(err) {
@@ -388,52 +394,51 @@ func (r *Runner[R, E]) executeTask(task *Task[R, E], resource R) bool { // resou
 			select {
 			case r.priorityQueue <- task:
 				// Task successfully re-queued.
-				r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.PriorityTasks, 1) }) // Re-increment priority task count.
+				r.priorityTasks.Add(1) // Re-increment priority task count.
 			default:
 				// Priority queue is full, cannot re-queue. Send error back immediately.
-				// Use non-blocking sends for results to avoid deadlocks during shutdown or full channels.
-				var zero E // Zero value for generic type E.
-				select {
-				case task.err <- fmt.Errorf("priority queue full, task requeue failed: %w", err):
-				case <-time.After(10 * time.Millisecond): // Avoid blocking indefinitely
-				}
-				select {
-				case task.result <- zero:
-				case <-time.After(10 * time.Millisecond): // Avoid blocking indefinitely
-				}
+				r.sendTaskResult(task, result, fmt.Errorf("priority queue full, task requeue failed: %w", err))
 			}
 		} else {
-			// Max retries exceeded. Send error and zero result back to caller.
-			var zero E
-			select {
-			case task.err <- fmt.Errorf("max retries exceeded for task: %w", err):
-			case <-time.After(10 * time.Millisecond):
-			}
-			select {
-			case task.result <- zero:
-			case <-time.After(10 * time.Millisecond):
-			}
+			// Max retries exceeded. Send error back to caller.
+			r.sendTaskResult(task, result, fmt.Errorf("max retries exceeded for task: %w", err))
 		}
 		return false // Worker should exit as its resource or itself might be unhealthy.
 	}
 
 	// Task completed successfully or with a "healthy" error. Send result back.
-	// Use non-blocking sends for results to avoid deadlocks.
+	r.sendTaskResult(task, result, err)
+	return true // Worker remains healthy and can continue processing.
+}
+
+// sendTaskResult safely sends task results back to the caller with proper error handling.
+// It ensures that results are delivered reliably without blocking indefinitely.
+func (r *Runner[R, E]) sendTaskResult(task *Task[R, E], result E, err error) {
+	// Create a context with timeout to prevent indefinite blocking
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// Send error first
 	select {
 	case task.err <- err:
-	case <-time.After(10 * time.Millisecond):
+	case <-ctx.Done():
+		// If we can't send the error, there's likely a programming error or shutdown
+		// In production, this might be logged
 	}
+
+	// Send result
 	select {
 	case task.result <- result:
-	case <-time.After(10 * time.Millisecond):
+	case <-ctx.Done():
+		// If we can't send the result, there's likely a programming error or shutdown
+		// In production, this might be logged
 	}
-	return true // Worker remains healthy and can continue processing.
 }
 
 // QueueTask adds a task to the main queue for asynchronous processing.
 // It blocks until the task can be added to the queue or the manager shuts down.
 // Once the task is processed by a worker, its result and error are returned.
-func (r *Runner[R, E]) QueueTask(taskFunc func(R) (E, error)) (E, error) { // taskFunc now accepts R directly
+func (r *Runner[R, E]) QueueTask(taskFunc func(R) (E, error)) (E, error) {
 	task := &Task[R, E]{
 		run: taskFunc,
 		// Buffered channels to ensure senders don't block immediately if receiver isn't ready.
@@ -443,9 +448,8 @@ func (r *Runner[R, E]) QueueTask(taskFunc func(R) (E, error)) (E, error) { // ta
 
 	select {
 	case r.mainQueue <- task:
-		r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.QueuedTasks, 1) }) // Increment count.
+		r.queuedTasks.Add(1) // Increment count.
 		// Wait for the task to be processed and results to be sent back.
-		// These receives will block until the worker sends on the channels.
 		res := <-task.result
 		err := <-task.err
 		return res, err
@@ -457,7 +461,7 @@ func (r *Runner[R, E]) QueueTask(taskFunc func(R) (E, error)) (E, error) { // ta
 
 // QueueTaskWithPriority adds a high priority task to the priority queue.
 // Similar to QueueTask, but tasks in this queue are processed first.
-func (r *Runner[R, E]) QueueTaskWithPriority(taskFunc func(R) (E, error)) (E, error) { // taskFunc now accepts R directly
+func (r *Runner[R, E]) QueueTaskWithPriority(taskFunc func(R) (E, error)) (E, error) {
 	task := &Task[R, E]{
 		run: taskFunc,
 		// Buffered channels for results.
@@ -467,7 +471,7 @@ func (r *Runner[R, E]) QueueTaskWithPriority(taskFunc func(R) (E, error)) (E, er
 
 	select {
 	case r.priorityQueue <- task:
-		r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.PriorityTasks, 1) }) // Increment count.
+		r.priorityTasks.Add(1) // Increment count.
 		res := <-task.result
 		err := <-task.err
 		return res, err
@@ -480,46 +484,51 @@ func (r *Runner[R, E]) QueueTaskWithPriority(taskFunc func(R) (E, error)) (E, er
 // RunTask executes a task immediately, attempting to use a resource from the pool.
 // If the pool is empty, a new temporary resource is created and destroyed after use.
 // This method is synchronous, blocking until the task completes.
-func (r *Runner[R, E]) RunTask(taskFunc func(R) (E, error)) (E, error) { // taskFunc now accepts R directly
-	var resource R // resource is now of type R directly
+func (r *Runner[R, E]) RunTask(taskFunc func(R) (E, error)) (E, error) {
+	var resource R
 	var err error
-	needsCleanup := false // Flag to determine if we need to manually destroy the resource.
+	fromPool := false
 
 	// Try to get a resource from the pool.
 	select {
-	case resource = <-r.resourcePool: // resource is of type R
-		r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.AvailableResources, -1) }) // Decrement available count.
-		// If acquired from pool, ensure it's returned to the pool afterwards.
-		defer func() {
-			select {
-			case r.resourcePool <- resource: // Return resource of type R
-				r.updateStats(func(s *TaskStats) { atomic.AddInt32(&s.AvailableResources, 1) }) // Increment available count.
-			case <-r.ctx.Done():
-				// If manager is shutting down, destroy the resource instead of returning to pool.
-				_ = r.onDestroy(resource) // onDestroy accepts R directly
-			}
-		}()
+	case resource = <-r.resourcePool:
+		fromPool = true
+		r.availableResources.Add(-1) // Decrement available count.
 	case <-r.ctx.Done():
 		var zero E
 		return zero, errors.New("task manager is shutting down: cannot run immediate task")
 	default:
 		// Pool is empty or unavailable, create a temporary resource.
-		resource, err = r.onCreate() // onCreate returns R directly
+		resource, err = r.onCreate()
 		if err != nil {
 			var zero E
 			return zero, fmt.Errorf("failed to create temporary resource for immediate task: %w", err)
 		}
-		needsCleanup = true // Mark for explicit destruction.
-		defer r.onDestroy(resource) // Ensure temporary resource is destroyed. onDestroy accepts R directly
 	}
 
+	// Ensure proper cleanup
+	defer func() {
+		if fromPool {
+			// Return to pool
+			select {
+			case r.resourcePool <- resource:
+				r.availableResources.Add(1) // Increment available count.
+			case <-r.ctx.Done():
+				// If manager is shutting down, destroy the resource instead of returning to pool.
+				if destroyErr := r.onDestroy(resource); destroyErr != nil {
+					// Handle cleanup error appropriately
+				}
+			}
+		} else {
+			// Temporary resource, destroy it
+			if destroyErr := r.onDestroy(resource); destroyErr != nil {
+				// Handle cleanup error appropriately
+			}
+		}
+	}()
+
 	// Execute the task with the obtained resource.
-	result, execErr := taskFunc(resource) // taskFunc now accepts R directly
-
-	// The `needsCleanup` logic is handled by the defer; no explicit action here.
-	_ = needsCleanup // Avoid "needsCleanup declared and not used" warning.
-
-	return result, execErr
+	return taskFunc(resource)
 }
 
 // startBurstManager initializes and runs a goroutine responsible for dynamic
@@ -558,47 +567,48 @@ func (r *Runner[R, E]) startBurstManager() {
 // It is called periodically by the burst manager.
 // It acquires a mutex to safely modify shared burst-related state.
 func (r *Runner[R, E]) manageBurst() {
-	r.burstMu.Lock() // Protect burst worker context slice and related operations.
+	r.burstMu.Lock()
 	defer r.burstMu.Unlock()
 
-	// Get current queue sizes. These are dynamically updated by task queuing/dequeuing.
-	mainQueueSize := len(r.mainQueue)
-	priorityQueueSize := len(r.priorityQueue)
+	// Get current queue sizes using atomic operations for accuracy
+	mainQueueSize := int(r.queuedTasks.Load())
+	priorityQueueSize := int(r.priorityTasks.Load())
 	totalQueued := mainQueueSize + priorityQueueSize
 
-	// Get current number of active burst workers.
-	currentBurstWorkers := int(r.burstWorkers.Load()) // Load atomic value.
-	currentActiveWorkers := int(r.activeWorkers.Load()) // Get current total active workers
+	// Get current worker counts
+	currentActiveWorkers := int(r.activeWorkers.Load())
+	currentBurstWorkers := int(r.burstWorkers.Load())
 
 	if totalQueued > r.burstTaskThreshold {
 		// Scale up: If tasks exceed threshold, create more burst workers.
-		// Calculate how many more burst workers *could* be added without exceeding maxWorkerCount.
-		// And how many more burst workers to add based on burstWorkerCount.
-		canAdd := r.maxWorkerCount - currentActiveWorkers //
-		toAdd := min(r.burstWorkerCount, canAdd)
+		canAdd := r.maxWorkerCount - currentActiveWorkers
+		wantToAdd := r.burstWorkerCount
+
+		// Don't add more than we can or more than needed based on queue size
+		// Add at most one worker per queued task above threshold
+		maxUseful := totalQueued - r.burstTaskThreshold
+		toAdd := min(wantToAdd, min(canAdd, maxUseful))
 
 		if toAdd > 0 {
 			for range toAdd {
 				// Create a new cancellable context for each burst worker.
-				// This allows individual burst workers to be stopped later.
 				burstCtx, cancel := context.WithCancel(r.ctx)
-				r.burstCtxs = append(r.burstCtxs, cancel) // Store the cancel function.
-				r.startWorker(burstCtx, true)             // Start a new burst worker.
+				r.burstCtxs = append(r.burstCtxs, cancel)
+				r.startWorker(burstCtx, true)
 			}
 		}
 	} else if totalQueued < r.burstTaskThreshold/2 && currentBurstWorkers > 0 {
 		// Scale down: If queue backlog is significantly reduced and burst workers exist.
-		// Reduce burst workers.
-		toRemove := min(currentBurstWorkers, len(r.burstCtxs))
+		// Remove some burst workers, but not all at once for stability
+		toRemove := min(currentBurstWorkers, max(1, currentBurstWorkers/2))
 
-		for range toRemove {
-			if len(r.burstCtxs) > 0 {
-				// Get the last added burst worker's cancel function and call it.
-				cancel := r.burstCtxs[len(r.burstCtxs)-1]
-				cancel()
-				// Remove the cancel function from the slice.
-				r.burstCtxs = r.burstCtxs[:len(r.burstCtxs)-1]
-			}
+		for i := 0; i < toRemove && len(r.burstCtxs) > 0; i++ {
+			// Get the last added burst worker's cancel function and call it.
+			lastIdx := len(r.burstCtxs) - 1
+			cancel := r.burstCtxs[lastIdx]
+			cancel()
+			// Remove the cancel function from the slice.
+			r.burstCtxs = r.burstCtxs[:lastIdx]
 		}
 	}
 }
@@ -606,36 +616,13 @@ func (r *Runner[R, E]) manageBurst() {
 // Stats returns current statistics about the task manager's operational state.
 // It provides a snapshot of worker counts, queued tasks, and resource availability.
 func (r *Runner[R, E]) Stats() TaskStats {
-	// Atomically load the current stats struct.
-	currentStats := r.stats.Load()
-
-	// Update volatile fields (queue lengths, active workers) just before returning.
-	// This provides the most up-to-date snapshot.
 	return TaskStats{
-		BaseWorkers:        currentStats.BaseWorkers,
+		BaseWorkers:        r.baseWorkerCount,
 		ActiveWorkers:      r.activeWorkers.Load(),
 		BurstWorkers:       r.burstWorkers.Load(),
-		QueuedTasks:        int32(len(r.mainQueue)),     // len() on channel is safe.
-		PriorityTasks:      int32(len(r.priorityQueue)), // len() on channel is safe.
-		AvailableResources: currentStats.AvailableResources, // This is updated atomically via updateStats
-	}
-}
-
-// updateStats safely updates the TaskStats held by the atomic pointer.
-// It takes a function that modifies the TaskStats struct.
-// This uses a compare-and-swap (CAS) loop to ensure thread-safe updates to the
-// TaskStats struct without needing a global mutex for all stats operations.
-func (r *Runner[R, E]) updateStats(updater func(*TaskStats)) {
-	for {
-		oldStats := r.stats.Load() // Load the current stats pointer.
-		newStats := *oldStats      // Dereference to get a copy of the struct.
-		updater(&newStats)         // Apply the update to the copy.
-
-		// Attempt to swap the old pointer with a pointer to the new struct.
-		if r.stats.CompareAndSwap(oldStats, &newStats) {
-			return // Successfully updated.
-		}
-		// If CAS failed, another goroutine updated it concurrently. Retry the loop.
+		QueuedTasks:        r.queuedTasks.Load(),
+		PriorityTasks:      r.priorityTasks.Load(),
+		AvailableResources: r.availableResources.Load(),
 	}
 }
 
@@ -645,7 +632,6 @@ func (r *Runner[R, E]) updateStats(updater func(*TaskStats)) {
 // It should be called to release resources and prevent goroutine leaks.
 func (r *Runner[R, E]) Stop() error {
 	// Step 1: Signal the burst manager to stop.
-	// Use a non-blocking send with a default case to avoid deadlocks if the channel is not read immediately.
 	select {
 	case r.burstStop <- struct{}{}:
 	default:
@@ -654,7 +640,7 @@ func (r *Runner[R, E]) Stop() error {
 	}
 
 	// Step 2: Cancel all burst workers.
-	r.burstMu.Lock() // Protect burstCtxs slice.
+	r.burstMu.Lock()
 	for _, cancel := range r.burstCtxs {
 		cancel() // Call cancel function for each burst worker.
 	}
@@ -676,4 +662,20 @@ func (r *Runner[R, E]) Stop() error {
 	r.drainResourcePool()
 
 	return nil
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// max returns the maximum of two integers
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

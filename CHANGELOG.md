@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/asaidimu/tasker/compare/v1.0.0...v1.1.0) (2025-06-30)
+
+
+### Features
+
+* **core:** enhance task queuing and introduce immediate shutdown ([c819e84](https://github.com/asaidimu/tasker/commit/c819e840cc8d22a60dd2c13e4ba2efbaca6ca528))
+
 # 1.0.0 (2025-06-14)
 
 

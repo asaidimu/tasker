@@ -113,6 +113,7 @@ func main() {
 	// Trigger a high-priority task during burst
 	fmt.Println("\nQueueing a high priority task during active bursting...")
 	go func() {
+		tasksSubmitted.Add(1)
 		result, err := manager.QueueTaskWithPriority(func(res *HeavyComputeResource) (string, error) {
 			fmt.Printf("Worker %d processing HIGH PRIORITY urgent report!\n", res.ID)
 			time.Sleep(50 * time.Millisecond)

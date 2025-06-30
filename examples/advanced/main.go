@@ -47,14 +47,12 @@ func main() {
 		WorkerCount:     2,                   // Start with 2 base workers
 		Ctx:             ctx,
 		CheckHealth:     checkComputeHealth,
-		BurstTaskThreshold:  5,                   // If 5+ tasks in queue, start bursting
-		BurstWorkerCount:      2,                   // Add 2 burst workers at a time
 		BurstInterval:   200 * time.Millisecond, // Check every 200ms
 		MaxRetries:      0,                   // No retries for this example
 		ResourcePoolSize: 0,                  // Not using RunTask heavily here
 	}
 
-	manager, err := tasker.NewRunner[*HeavyComputeResource, string](config)
+	manager, err := tasker.NewTaskManager[*HeavyComputeResource, string](config)
 	if err != nil {
 		log.Fatalf("Error creating task manager: %v", err)
 	}

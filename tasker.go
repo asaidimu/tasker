@@ -160,9 +160,13 @@ type Config[R any] struct {
 
 	// Optional: Custom metrics collector
 	Collector MetricsCollector
-	// Deprecated
+
+	// Deprecated: The new rate-based scaling automatically adjusts worker
+	// counts based on real-time workload, making this field obsolete
 	BurstTaskThreshold int
-	// Deprecated
+
+	// Deprecated: The new rate-based scaling automatically adjusts worker
+	// counts based on real-time workload, making this field obsolete
 	BurstWorkerCount int
 }
 
@@ -231,7 +235,7 @@ type Manager[R any, E any] struct {
 	collector MetricsCollector
 }
 
-// Deprecated. Use NewTaskManager instead
+// Deprecated: Use NewTaskManager instead
 func NewRunner[R any, E any](config Config[R]) (TaskManager[R, E], error) {
 	return NewTaskManager[R, E](config)
 }

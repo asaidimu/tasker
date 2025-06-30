@@ -40,7 +40,7 @@ func main() {
 	}
 
 	// Create a new task manager
-	manager, err := tasker.NewRunner[*CalculatorResource, int](config) // Tasks will return an int result
+	manager, err := tasker.NewTaskManager[*CalculatorResource, int](config) // Tasks will return an int result
 	if err != nil {
 		log.Fatalf("Error creating task manager: %v", err)
 	}

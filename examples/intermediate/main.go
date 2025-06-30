@@ -55,7 +55,7 @@ func main() {
 		ResourcePoolSize: 1,           // Small pool for RunTask
 	}
 
-	manager, err := tasker.NewRunner[*ImageProcessor, string](config) // Tasks return string (e.g., image path)
+	manager, err := tasker.NewTaskManager[*ImageProcessor, string](config) // Tasks return string (e.g., image path)
 	if err != nil {
 		log.Fatalf("Error creating task manager: %v", err)
 	}

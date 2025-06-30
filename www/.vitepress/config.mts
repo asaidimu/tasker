@@ -3,7 +3,7 @@ import { defineConfig } from 'vitepress';
 export default defineConfig({
   title: "Documentation",
   lang: 'en-US',
-  base: '/',
+  base: '/tasker',
   lastUpdated: true,
   cleanUrls: true,
 

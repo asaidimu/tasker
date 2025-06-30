@@ -1,7 +1,7 @@
 # Tasker: A Robust Concurrent Task Management Library for Go
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/asaidimu/tasker.svg)](https://pkg.go.dev/github.com/asaidimu/tasker)
-[![Build Status](https://github.com/asaidimu/tasker/workflows/Test%20Workflow/badge.svg)](https://github.com/asaidimu/tasker/actions)
+[![Build Status](https://github.com/asaidimu/tasker/actions/workflows/test.yml/badge.svg)](https://github.com/asaidimu/tasker/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Tasker** is a powerful and flexible Go library designed for efficient management of concurrent tasks. It provides a highly customizable worker pool, dynamic scaling (bursting), priority queuing, and robust resource lifecycle management, making it ideal for processing background jobs, handling I/O-bound operations, or managing CPU-intensive computations with controlled concurrency.
@@ -10,9 +10,6 @@
 - [Overview & Features](#overview--features)
 - [Installation & Setup](#installation--setup)
 - [Usage Documentation](#usage-documentation)
-  - [Basic Usage: Simple Calculator](#basic-usage-simple-calculator)
-  - [Intermediate Usage: Image Processing with Health Checks & Pooling](#intermediate-usage-image-processing-with-health-checks--pooling)
-  - [Advanced Usage: Dynamic Scaling (Bursting) & Graceful Shutdown](#advanced-usage-dynamic-scaling-bursting--graceful-shutdown)
 - [Project Architecture](#project-architecture)
 - [Development & Contributing](#development--contributing)
 - [Additional Information](#additional-information)
@@ -23,16 +20,24 @@
 
 In modern applications, efficiently managing concurrent tasks and shared resources is critical. `tasker` addresses this by providing a comprehensive solution that abstracts away the complexities of goroutine management, worker pools, and resource lifecycles. It allows developers to define tasks that operate on specific resources (e.g., database connections, external API clients, custom compute units) and then queue these tasks for execution, letting `tasker` handle the underlying concurrency, scaling, and error recovery.
 
+This library is particularly useful for applications that:
+*   Need to process a high volume of background jobs reliably.
+*   Perform operations on limited or expensive shared resources.
+*   Require dynamic adjustment of processing capacity based on load.
+*   Demand prioritization of certain critical tasks over others.
+
 ### Key Features
 
-*   **Concurrent Task Execution**: Manages a pool of workers to execute tasks concurrently.
-*   **Generic Resource Management**: Define custom `OnCreate` and `OnDestroy` functions for any resource type (`R`), ensuring proper setup and cleanup.
-*   **Dynamic Worker Scaling (Bursting)**: Automatically scales up and down the number of workers based on queue backlog, ensuring optimal resource utilization during peak loads.
-*   **Priority Queues**: Supports both standard and high-priority task queues, allowing critical operations to bypass regular tasks.
-*   **Immediate Task Execution with Resource Pooling (`RunTask`)**: Execute tasks synchronously, either by acquiring a resource from a pre-allocated pool or by temporarily creating a new one, ideal for urgent, low-latency operations.
-*   **Customizable Health Checks & Retries**: Define custom logic (`CheckHealth`) to determine if a worker/resource is unhealthy, enabling automatic worker replacement and configurable task retries for transient failures.
-*   **Graceful Shutdown**: Ensures all active tasks complete and resources are properly released during shutdown, preventing data loss or resource leaks.
-*   **Real-time Performance Metrics**: Access live statistics on active workers, queued tasks, and available resources for monitoring and debugging.
+*   **Concurrent Task Execution**: Manages a pool of workers to execute tasks concurrently, ensuring optimal utilization of system resources.
+*   **Generic Resource Management**: Define custom `OnCreate` and `OnDestroy` functions for any resource type (`R`), guaranteeing proper setup and cleanup of external dependencies or expensive objects.
+*   **Rate-Based Dynamic Worker Scaling**: Automatically scales the number of workers up or down based on the real-time task arrival and completion rates. This ensures that the system's throughput dynamically matches the incoming workload, optimizing resource utilization and responsiveness without manual tuning.
+*   **Priority Queues**: Supports both standard (`QueueTask`) and high-priority (`QueueTaskWithPriority`) task queues, allowing critical operations to bypass regular tasks and get processed faster.
+*   **Immediate Task Execution with Resource Pooling (`RunTask`)**: Execute tasks synchronously, either by acquiring a resource from a pre-allocated pool or by temporarily creating a new one. This is ideal for urgent, low-latency operations that should not be delayed by queuing.
+*   **Customizable Health Checks & Retries**: Define custom logic (`CheckHealth`) to determine if a given error indicates an "unhealthy" state for a worker or its associated resource, enabling automatic worker replacement and configurable task retries for transient failures.
+*   **"At-Most-Once" Task Execution**: Provides `QueueTaskOnce` and `QueueTaskWithPriorityOnce` methods for non-idempotent operations, preventing re-queuing on health-related failures.
+*   **Graceful & Immediate Shutdown**: Offers both `Stop()` for graceful shutdown (waiting for active tasks to complete) and `Kill()` for immediate termination (cancelling all tasks), giving control over shutdown behavior.
+*   **Real-time Performance Metrics**: Access live statistics (`Stats()`) and comprehensive performance metrics (`Metrics()`), including task arrival/completion rates, average/min/max/percentile execution times, average wait times, and success/failure rates, for robust monitoring and debugging.
+*   **Custom Logging**: Integrate with your preferred logging solution by providing an implementation of the `tasker.Logger` interface.
 
 ---
 
@@ -52,16 +57,18 @@ go get github.com/asaidimu/tasker
 
 ### Verification
 
-You can verify the installation by building and running the provided examples:
+You can verify the installation and see `tasker` in action by building and running the provided examples:
 
 ```bash
-cd $GOPATH/src/github.com/asaidimu/tasker/examples/basic
+# Navigate to the examples directory within your Go module path
+# This assumes your GOPATH is set correctly, typically within your user home directory.
+cd "$(go env GOPATH)/src/github.com/asaidimu/tasker/examples/basic"
 go run main.go
 
-cd $GOPATH/src/github.com/asaidimu/tasker/examples/intermediate
+cd "$(go env GOPATH)/src/github.com/asaidimu/tasker/examples/intermediate"
 go run main.go
 
-cd $GOPATH/src/github.com/asaidimu/tasker/examples/advanced
+cd "$(go env GOPATH)/src/github.com/asaidimu/tasker/examples/advanced"
 go run main.go
 ```
 
@@ -69,26 +76,30 @@ go run main.go
 
 ## Usage Documentation
 
-`tasker` is designed to be highly configurable and flexible. All interactions happen through the `tasker.NewRunner` constructor and the returned `TaskManager` interface.
+`tasker` is designed to be highly configurable and flexible. All interactions happen through the `tasker.NewTaskManager` constructor and the returned `TaskManager` interface.
 
 ### Core Concepts
 
-*   **Resource (R)**: This is the type of resource your tasks will operate on. It could be anything: a database connection, an HTTP client, a custom processing struct, etc. `tasker` manages the lifecycle of these resources.
-*   **Task Result (E)**: This is the type of value your tasks will return upon successful completion.
-*   **Task Function**: Your actual work logic is defined as a `func(resource R) (result E, err error)`.
-*   **`tasker.Config[R]`**: Configures the `Runner` with resource lifecycle functions (`OnCreate`, `OnDestroy`), worker counts, scaling parameters, and more.
-*   **`tasker.Runner[R, E]`**: The core task manager that implements `TaskManager[R, E]`.
-*   **`QueueTask`**: Adds a task to the standard queue for asynchronous processing. Returns the result once the task completes.
-*   **`QueueTaskWithPriority`**: Adds a task to a dedicated high-priority queue. These tasks are picked up before standard queued tasks.
-*   **`RunTask`**: Executes a task immediately. It tries to get a resource from a pre-allocated pool or creates a temporary one if needed. This is a synchronous call.
-*   **`Stop()`**: Gracefully shuts down the manager, allowing active tasks to complete.
-*   **`Stats()`**: Provides real-time operational statistics.
+*   **Resource (`R`)**: This is the generic type of resource your tasks will operate on. It could be anything: a database connection, an HTTP client, a custom processing struct, a CPU/GPU compute unit, or any other external dependency or expensive object that needs managed lifecycle. `tasker` manages the creation, use, and destruction of these resources.
+*   **Task Result (`E`)**: This is the generic type of value your tasks will return upon successful completion. This allows `tasker` to be type-safe for various task outputs.
+*   **Task Function**: Your actual work logic is defined as a `func(resource R) (result E, err error)`. This function receives an instance of your defined `R` resource type. It's expected to return the result `E` or an `error`.
+*   **`tasker.Config[R]`**: A struct used to configure the `TaskManager` with essential parameters such as resource lifecycle functions (`OnCreate`, `OnDestroy`), initial worker counts, dynamic scaling parameters, optional health check logic, and custom logging/metrics.
+*   **`tasker.Manager[R, E]`**: The concrete implementation of the `TaskManager[R, E]` interface, providing the core task management capabilities. You instantiate this via `tasker.NewTaskManager`.
+*   **`QueueTask(func(R) (E, error)) (E, error)`**: Adds a task to the standard queue for asynchronous processing. The call blocks until the task completes and returns its result or error. Suitable for background processing.
+*   **`QueueTaskWithPriority(func(R) (E, error)) (E, error)`**: Adds a task to a dedicated high-priority queue. Tasks in this queue are processed before tasks in the main queue, ensuring faster execution for critical operations. This call also blocks until completion.
+*   **`QueueTaskOnce(func(R) (E, error)) (E, error)`**: Similar to `QueueTask`, but if the task fails and `CheckHealth` indicates an unhealthy worker, this task will *not* be retried. Use for non-idempotent operations where "at-most-once" processing by `tasker` is desired.
+*   **`QueueTaskWithPriorityOnce(func(R) (E, error)) (E, error)`**: Combines high priority with "at-most-once" execution semantics.
+*   **`RunTask(func(R) (E, error)) (E, error)`**: Executes a task immediately. It attempts to acquire a resource from a pre-allocated pool first. If the pool is empty, it temporarily creates a new resource for the task. This is a synchronous call, blocking until the task finishes. Ideal for urgent, low-latency operations that should not be delayed by queuing.
+*   **`Stop() error`**: Initiates a graceful shutdown of the manager. It stops accepting new tasks and waits for all currently queued and executing tasks to complete before releasing resources.
+*   **`Kill() error`**: Initiates an immediate shutdown of the manager. It cancels all running tasks and drops all queued tasks without waiting for them to complete, then releases resources.
+*   **`Stats() TaskStats`**: Returns a `TaskStats` struct containing real-time operational statistics, such as active worker counts, queued task counts, and available resources.
+*   **`Metrics() TaskMetrics`**: Returns a `TaskMetrics` struct providing comprehensive performance metrics, including task arrival/completion rates, various execution time percentiles (P95, P99), average wait times, and success/failure rates.
 
 ---
 
 ### Basic Usage: Simple Calculator
 
-This example demonstrates the fundamental setup for `tasker` using a simple `CalculatorResource`.
+This example demonstrates the fundamental setup for `tasker` using a simple `CalculatorResource` with two base workers.
 
 ```go
 // examples/basic/main.go
@@ -134,7 +145,7 @@ func main() {
 	}
 
 	// Create a new task manager
-	manager, err := tasker.NewRunner[*CalculatorResource, int](config) // Tasks will return an int result
+	manager, err := tasker.NewTaskManager[*CalculatorResource, int](config) // Tasks will return an int result
 	if err != nil {
 		log.Fatalf("Error creating task manager: %v", err)
 	}
@@ -191,7 +202,7 @@ func main() {
 }
 ```
 
-**Expected Output (Illustrative, timings may vary):**
+**Expected Output (Illustrative, timings may vary due to concurrency):**
 ```
 --- Basic Usage: Simple Calculator ---
 INFO: Creating CalculatorResource
@@ -213,402 +224,6 @@ Basic usage example finished.
 
 ---
 
-### Intermediate Usage: Image Processing with Health Checks & Pooling
-
-This example introduces more advanced features like custom health checks (`CheckHealth`), task retries (`MaxRetries`), high-priority queuing (`QueueTaskWithPriority`), and immediate execution with resource pooling (`RunTask`).
-
-```go
-// examples/intermediate/main.go
-package main
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"log"
-	"math/rand"
-	"time"
-
-	"github.com/asaidimu/tasker"
-)
-
-// ImageProcessor represents a resource for image manipulation.
-type ImageProcessor struct {
-	ID        int
-	IsHealthy bool
-}
-
-// onCreate for ImageProcessor: simulates creating a connection to an image processing service.
-func createImageProcessor() (*ImageProcessor, error) {
-	id := rand.Intn(1000)
-	fmt.Printf("INFO: Creating ImageProcessor %d\n", id)
-	return &ImageProcessor{ID: id, IsHealthy: true}, nil
-}
-
-// onDestroy for ImageProcessor: simulates closing the connection.
-func destroyImageProcessor(p *ImageProcessor) error {
-	fmt.Printf("INFO: Destroying ImageProcessor %d\n", p.ID)
-	return nil
-}
-
-// checkImageProcessorHealth: Custom health check.
-// If the error is "processor_crash", consider the worker/resource unhealthy.
-func checkImageProcessorHealth(err error) bool {
-	if err != nil && err.Error() == "processor_crash" {
-		fmt.Printf("WARN: Detected unhealthy error: %v. Worker will be replaced.\n", err)
-		return false // This error indicates an unhealthy state
-	}
-	return true // Other errors are just task failures, not worker health issues
-}
-
-func main() {
-	fmt.Println("\n--- Intermediate Usage: Image Processing ---")
-
-	ctx := context.Background()
-
-	config := tasker.Config[*ImageProcessor]{
-		OnCreate:         createImageProcessor,
-		OnDestroy:        destroyImageProcessor,
-		WorkerCount:      2,           // Two base workers
-		Ctx:              ctx,
-		CheckHealth:      checkImageProcessorHealth, // Use custom health check
-		MaxRetries:       1,           // One retry on unhealthy errors
-		ResourcePoolSize: 1,           // Small pool for RunTask
-	}
-
-	manager, err := tasker.NewRunner[*ImageProcessor, string](config) // Tasks return string (e.g., image path)
-	if err != nil {
-		log.Fatalf("Error creating task manager: %v", err)
-	}
-	defer manager.Stop()
-
-	// --- 1. Queue a normal image resize task ---
-	fmt.Println("\nQueueing a normal image resize task...")
-	go func() {
-		result, err := manager.QueueTask(func(proc *ImageProcessor) (string, error) {
-			fmt.Printf("Worker %d processing normal resize for imageA.jpg\n", proc.ID)
-			time.Sleep(150 * time.Millisecond)
-			if rand.Intn(10) < 3 { // Simulate a healthy but non-fatal processing error 30% of the time
-				return "", errors.New("image_corrupted")
-			}
-			return "imageA_resized.jpg", nil
-		})
-		if err != nil {
-			fmt.Printf("Normal Resize Failed: %v\n", err)
-		} else {
-			fmt.Printf("Normal Resize Completed: %s\n", result)
-		}
-	}()
-
-	// --- 2. Queue a high-priority thumbnail generation task ---
-	fmt.Println("Queueing a high-priority thumbnail task...")
-	go func() {
-		result, err := manager.QueueTaskWithPriority(func(proc *ImageProcessor) (string, error) {
-			fmt.Printf("Worker %d processing HIGH PRIORITY thumbnail for video.mp4\n", proc.ID)
-			time.Sleep(50 * time.Millisecond) // Faster processing
-			return "video_thumbnail.jpg", nil
-		})
-		if err != nil {
-			fmt.Printf("Priority Thumbnail Failed: %v\n", err)
-		} else {
-			fmt.Printf("Priority Thumbnail Completed: %s\n", result)
-		}
-	}()
-
-	// --- 3. Simulate a task that causes an "unhealthy" error ---
-	fmt.Println("Queueing a task that might crash a worker (unhealthy error)...")
-	go func() {
-		result, err := manager.QueueTask(func(proc *ImageProcessor) (string, error) {
-			fmt.Printf("Worker %d processing problematic image (might crash)\n", proc.ID)
-			time.Sleep(100 * time.Millisecond)
-			if rand.Intn(2) == 0 { // 50% chance to simulate a crash
-				return "", errors.New("processor_crash") // This triggers CheckHealth to return false
-			}
-			return "problematic_image_processed.jpg", nil
-		})
-		if err != nil {
-			fmt.Printf("Problematic Image Task Failed: %v\n", err)
-		} else {
-			fmt.Printf("Problematic Image Task Completed: %s\n", result)
-		}
-	}()
-
-	// --- 4. Run an immediate task (e.g., generate a preview for a user) ---
-	fmt.Println("\nRunning an immediate task (using resource pool or temporary resource)...")
-	immediateResult, immediateErr := manager.RunTask(func(proc *ImageProcessor) (string, error) {
-		fmt.Printf("IMMEDIATE Task processing fast preview with processor %d\n", proc.ID)
-		time.Sleep(20 * time.Millisecond)
-		return "fast_preview.jpg", nil
-	})
-	if immediateErr != nil {
-		fmt.Printf("Immediate Task Failed: %v\n", immediateErr)
-	} else {
-		fmt.Printf("Immediate Task Completed: %s\n", immediateResult)
-	}
-
-	// Give time for tasks and potential worker replacements
-	time.Sleep(1 * time.Second)
-
-	stats := manager.Stats()
-	fmt.Printf("\n--- Current Stats ---\n")
-	fmt.Printf("Base Workers: %d\n", stats.BaseWorkers)
-	fmt.Printf("Active Workers: %d\n", stats.ActiveWorkers)
-	fmt.Printf("Queued Tasks: %d\n", stats.QueuedTasks)
-	fmt.Printf("Priority Tasks: %d\n", stats.PriorityTasks)
-	fmt.Printf("Available Resources: %d\n", stats.AvailableResources)
-	fmt.Println("----------------------")
-
-	fmt.Println("Intermediate usage example finished.")
-}
-```
-
-**Expected Output (Illustrative, order and IDs may vary due to concurrency and random failures):**
-```
---- Intermediate Usage: Image Processing ---
-INFO: Creating ImageProcessor 719
-INFO: Creating ImageProcessor 409
-INFO: Creating ImageProcessor 981
-Queueing a normal image resize task...
-Queueing a high-priority thumbnail task...
-Queueing a task that might crash a worker (unhealthy error)...
-
-Running an immediate task (using resource pool or temporary resource)...
-IMMEDIATE Task processing fast preview with processor 981
-Worker 719 processing HIGH PRIORITY thumbnail for video.mp4
-Immediate Task Completed: fast_preview.jpg
-Priority Thumbnail Completed: video_thumbnail.jpg
-Worker 409 processing normal resize for imageA.jpg
-Worker 719 processing problematic image (might crash)
-Normal Resize Completed: imageA_resized.jpg
-WARN: Detected unhealthy error: processor_crash. Worker will be replaced.
-INFO: Destroying ImageProcessor 719
-INFO: Creating ImageProcessor 507
-Problematic Image Task Failed: max retries exceeded for task: processor_crash
-
---- Current Stats ---
-Base Workers: 2
-Active Workers: 2
-Queued Tasks: 0
-Priority Tasks: 0
-Available Resources: 1
-----------------------
-Intermediate usage example finished.
-```
-Notice how `processor_crash` leads to a `WARN` and the worker being replaced, showcasing the `CheckHealth` functionality.
-
----
-
-### Advanced Usage: Dynamic Scaling (Bursting) & Graceful Shutdown
-
-This example showcases `tasker`'s dynamic scaling capabilities (`BurstTaskThreshold`, `BurstWorkerCount`, `BurstInterval`) to handle fluctuating loads and demonstrates a comprehensive graceful shutdown procedure.
-
-```go
-// examples/advanced/main.go
-package main
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"log"
-	"math/rand"
-	"sync/atomic"
-	"time"
-
-	"github.com/asaidimu/tasker"
-)
-
-// HeavyComputeResource represents a resource for intensive computations.
-type HeavyComputeResource struct {
-	ID int
-}
-
-// onCreate for HeavyComputeResource: simulates allocating CPU/GPU resources.
-func createComputeResource() (*HeavyComputeResource, error) {
-	id := rand.Intn(1000)
-	fmt.Printf("INFO: Creating HeavyComputeResource %d\n", id)
-	return &HeavyComputeResource{ID: id}, nil
-}
-
-// onDestroy for HeavyComputeResource: simulates releasing CPU/GPU resources.
-func destroyComputeResource(r *HeavyComputeResource) error {
-	fmt.Printf("INFO: Destroying HeavyComputeResource %d\n", r.ID)
-	return nil
-}
-
-// checkComputeHealth: All errors are considered healthy (task-specific, not worker-specific)
-func checkComputeHealth(err error) bool {
-	return true
-}
-
-func main() {
-	fmt.Println("\n--- Advanced Usage: Dynamic Scaling (Bursting) ---")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // Ensure the main context is cancelled on exit
-
-	config := tasker.Config[*HeavyComputeResource]{
-		OnCreate:        createComputeResource,
-		OnDestroy:       destroyComputeResource,
-		WorkerCount:     2,                   // Start with 2 base workers
-		Ctx:             ctx,
-		CheckHealth:     checkComputeHealth,
-		BurstTaskThreshold:  5,                   // If 5+ tasks in queue, start bursting
-		BurstWorkerCount:      2,                   // Add 2 burst workers at a time
-		BurstInterval:   200 * time.Millisecond, // Check every 200ms
-		MaxRetries:      0,                   // No retries for this example
-		ResourcePoolSize: 0,                  // Not using RunTask heavily here
-	}
-
-	manager, err := tasker.NewRunner[*HeavyComputeResource, string](config)
-	if err != nil {
-		log.Fatalf("Error creating task manager: %v", err)
-	}
-	// Do NOT defer manager.Stop() here. We will call it manually with a delay to observe shutdown.
-
-	var tasksSubmitted atomic.Int32
-	var tasksCompleted atomic.Int32
-
-	// --- 1. Aggressively queue a large number of tasks ---
-	fmt.Println("\nAggressively queuing 20 heavy computation tasks...")
-	for i := range 20 {
-		taskID := i
-		tasksSubmitted.Add(1)
-		go func() {
-			result, err := manager.QueueTask(func(res *HeavyComputeResource) (string, error) {
-				processingTime := time.Duration(100 + rand.Intn(300)) * time.Millisecond // 100-400ms work
-				fmt.Printf("Worker %d processing Task %d for %s\n", res.ID, taskID, processingTime)
-				time.Sleep(processingTime)
-				if rand.Intn(10) == 0 { // 10% chance of failure
-					return "", errors.New(fmt.Sprintf("computation_error_task_%d", taskID))
-				}
-				return fmt.Sprintf("Task %d completed", taskID), nil
-			})
-			if err != nil {
-				fmt.Printf("Task %d failed: %v\n", taskID, err)
-			} else {
-				fmt.Printf("Task %d result: %s\n", taskID, result)
-				tasksCompleted.Add(1)
-			}
-		}()
-	}
-
-	// --- 2. Monitor stats to observe bursting ---
-	fmt.Println("\nMonitoring stats (watch for BurstWorkers)...")
-	ticker := time.NewTicker(250 * time.Millisecond)
-	done := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				stats := manager.Stats()
-				fmt.Printf("Stats: Active=%d (Base=%d, Burst=%d), Queued=%d (Main=%d, Prio=%d), AvailRes=%d, Comp=%d/%d\n",
-					stats.ActiveWorkers, stats.BaseWorkers, stats.BurstWorkers,
-					stats.QueuedTasks+stats.PriorityTasks, stats.QueuedTasks, stats.PriorityTasks,
-					stats.AvailableResources, tasksCompleted.Load(), tasksSubmitted.Load())
-			case <-done:
-				ticker.Stop()
-				return
-			}
-		}
-	}()
-
-	// Let the system run for a while to observe scaling up and down
-	time.Sleep(5 * time.Second)
-
-	// Trigger a high-priority task during burst
-	fmt.Println("\nQueueing a high priority task during active bursting...")
-	go func() {
-		result, err := manager.QueueTaskWithPriority(func(res *HeavyComputeResource) (string, error) {
-			fmt.Printf("Worker %d processing HIGH PRIORITY urgent report!\n", res.ID)
-			time.Sleep(50 * time.Millisecond)
-			return "Urgent report generated!", nil
-		})
-		if err != nil {
-			fmt.Printf("Urgent task failed: %v\n", err)
-		} else {
-			fmt.Printf("Urgent task result: %s\n", result)
-			tasksCompleted.Add(1)
-		}
-	}()
-
-	time.Sleep(2 * time.Second) // Allow priority task and more processing
-
-	// --- 3. Graceful Shutdown ---
-	fmt.Println("\nInitiating graceful shutdown...")
-	close(done) // Stop the stats monitoring goroutine
-	err = manager.Stop()
-	if err != nil {
-		fmt.Printf("Error during shutdown: %v\n", err)
-	} else {
-		fmt.Println("Task manager gracefully shut down.")
-	}
-
-	stats := manager.Stats()
-	fmt.Printf("\n--- Final Stats After Shutdown ---\n")
-	fmt.Printf("Active Workers: %d\n", stats.ActiveWorkers) // Should be 0
-	fmt.Printf("Burst Workers: %d\n", stats.BurstWorkers)   // Should be 0
-	fmt.Printf("Queued Tasks: %d\n", stats.QueuedTasks)     // Should be 0
-	fmt.Printf("Priority Tasks: %d\n", stats.PriorityTasks) // Should be 0
-	fmt.Printf("Available Resources: %d\n", stats.AvailableResources) // Should be 0
-	fmt.Printf("Tasks Completed: %d / %d\n", tasksCompleted.Load(), tasksSubmitted.Load())
-	fmt.Println("---------------------------------")
-
-	fmt.Println("Advanced usage example finished.")
-}
-```
-
-**Expected Output (Illustrative, IDs and timings vary greatly):**
-```
---- Advanced Usage: Dynamic Scaling (Bursting) ---
-INFO: Creating HeavyComputeResource 578
-INFO: Creating HeavyComputeResource 662
-
-Aggressively queuing 20 heavy computation tasks...
-
-Monitoring stats (watch for BurstWorkers)...
-Stats: Active=2 (Base=2, Burst=0), Queued=20 (Main=20, Prio=0), AvailRes=0, Comp=0/20
-Worker 578 processing Task 0 for 191ms
-Stats: Active=2 (Base=2, Burst=0), Queued=19 (Main=19, Prio=0), AvailRes=0, Comp=0/20
-Worker 662 processing Task 1 for 142ms
-Stats: Active=2 (Base=2, Burst=0), Queued=18 (Main=18, Prio=0), AvailRes=0, Comp=0/20
-INFO: Creating HeavyComputeResource 811
-INFO: Creating HeavyComputeResource 824
-Stats: Active=4 (Base=2, Burst=2), Queued=16 (Main=16, Prio=0), AvailRes=0, Comp=0/20
-Worker 578 processing Task 2 for 211ms
-Task 0 result: Task 0 completed
-Worker 662 processing Task 3 for 308ms
-Task 1 result: Task 1 completed
-Stats: Active=4 (Base=2, Burst=2), Queued=14 (Main=14, Prio=0), AvailRes=0, Comp=2/20
-... (more workers spin up, tasks complete) ...
-Stats: Active=6 (Base=2, Burst=4), Queued=3 (Main=3, Prio=0), AvailRes=0, Comp=17/20
-Stats: Active=4 (Base=2, Burst=2), Queued=1 (Main=1, Prio=0), AvailRes=0, Comp=18/20
-
-Queueing a high priority task during active bursting...
-Stats: Active=2 (Base=2, Burst=0), Queued=1 (Main=0, Prio=1), AvailRes=0, Comp=19/20
-Worker 578 processing HIGH PRIORITY urgent report!
-Urgent task result: Urgent report generated!
-Task 19 result: Task 19 completed
-
-Initiating graceful shutdown...
-Stats: Active=2 (Base=2, Burst=0), Queued=0 (Main=0, Prio=0), AvailRes=0, Comp=20/20
-INFO: Destroying HeavyComputeResource 578
-INFO: Destroying HeavyComputeResource 662
-Task manager gracefully shut down.
-
---- Final Stats After Shutdown ---
-Active Workers: 0
-Burst Workers: 0
-Queued Tasks: 0
-Priority Tasks: 0
-Available Resources: 0
-Tasks Completed: 20 / 20
----------------------------------
-Advanced usage example finished.
-```
-This output clearly shows `BurstWorkers` increasing and then decreasing as the queue size changes, and ultimately all resources being destroyed during graceful shutdown.
-
----
 
 ## Project Architecture
 
@@ -616,42 +231,49 @@ This output clearly shows `BurstWorkers` increasing and then decreasing as the q
 
 ### Core Components
 
-*   **`Runner[R, E]`**: The central orchestrator. It manages the lifecycle of workers, resources, and tasks. It holds the configuration, queues, and synchronizes operations.
-*   **Worker Goroutines**: These are the workhorses. Each worker holds a single resource (`R`) and continuously picks tasks from the priority queue or main queue. They handle task execution, error reporting, and retry logic based on `CheckHealth`.
-*   **Task Queues (`mainQueue`, `priorityQueue`)**: Unbuffered channels (`chan *Task[R, E]`) acting as FIFO queues for tasks awaiting execution. `priorityQueue` is always checked first by workers.
-*   **Resource Pool (`resourcePool`)**: A buffered channel holding pre-allocated `R` type resources, primarily used by `RunTask` for immediate, low-latency task execution without waiting for a dedicated worker.
-*   **Burst Manager Goroutine**: (If configured) This goroutine periodically monitors the task queue backlog. If the backlog exceeds `BurstTaskThreshold`, it spins up additional "burst" workers. If the backlog shrinks, it gracefully scales down burst workers.
-*   **`Task[R, E]`**: A struct encapsulating the task function, channels for returning results (`result chan E`, `err chan error`), and a retry counter.
-*   **`Config[R]`**: Defines the behavior of the `Runner`, including resource creation/destruction, worker counts, scaling parameters, and health check logic.
-*   **`TaskStats`**: Provides a snapshot of the `Runner`'s current operational state, including worker counts and queue sizes.
+*   **`Manager[R, E]`**: The central orchestrator, implementing the `TaskManager` interface. It holds the `Config`, manages task queues, synchronizes operations, and oversees the lifecycle of workers and resources. It's the primary interface for users to interact with `tasker`.
+*   **Worker Goroutines**: These are the workhorses of `tasker`. Each worker runs in its own goroutine, typically holding a single long-lived resource (`R`). Workers continuously pull tasks from the `priorityQueue` or `mainQueue`, execute them, handle errors, and manage retries based on the `CheckHealth` function.
+*   **Task Queues (`mainQueue`, `priorityQueue`)**: These are Go channels (`chan *Task[R, E]`) acting as FIFO queues. The `priorityQueue` is always checked first by workers, ensuring high-priority tasks are processed ahead of standard tasks.
+*   **Resource Pool (`resourcePool`)**: A buffered channel holding pre-allocated `R` type resources. This pool is primarily used by `RunTask` operations to provide immediate resource access for synchronous, low-latency task execution, avoiding the main queues.
+*   **Burst Manager Goroutine**: This background goroutine is responsible for dynamic worker scaling. It periodically fetches performance `Metrics` (specifically `TaskArrivalRate` and `TaskCompletionRate`). If the arrival rate significantly exceeds the completion rate, it instructs the `Manager` to start new burst workers. Conversely, if the system is over-provisioned (completion rate much higher than arrival rate), it signals idle burst workers to shut down.
+*   **`Task[R, E]`**: An internal struct that encapsulates a task's executable function (`run`), channels for returning its result (`result chan E`) and any error (`err chan error`) to the caller, and a retry counter (`retries`) for fault tolerance. It also stores `queuedAt` for metrics calculations.
+*   **`Config[R]`**: A comprehensive struct that defines the operational parameters for creating a `Manager` instance. This includes essential functions for resource lifecycle management (`OnCreate`, `OnDestroy`), `WorkerCount`, `MaxWorkerCount`, dynamic scaling parameters (`BurstInterval`), retry policy (`MaxRetries`), and optional custom logging (`Logger`) and metrics collection (`Collector`).
+*   **`TaskStats` & `TaskMetrics`**: These structs provide real-time snapshots of the `Manager`'s current operational state (`Stats()`) and in-depth performance statistics (`Metrics()`), respectively. `TaskMetrics` includes values like average, min, max, P95, and P99 execution times, wait times, arrival/completion rates, and success/failure rates.
+*   **`Logger` and `MetricsCollector` Interfaces**: These interfaces allow for flexible integration with external logging and monitoring systems.
 
 ### Data Flow
 
-1.  **Initialization**: `NewRunner` creates base workers, initializes the resource pool, and starts the optional burst manager. `OnCreate` is called for each resource.
+1.  **Initialization**: Upon calling `NewTaskManager`, `tasker` creates the specified number of base workers, initializes the resource pool by calling `OnCreate` for each pooled resource, and starts the dedicated burst manager goroutine.
 2.  **Task Submission**:
-    *   `QueueTask` sends `*Task[R, E]` to `mainQueue`.
-    *   `QueueTaskWithPriority` sends `*Task[R, E]` to `priorityQueue`.
-    *   `RunTask` directly attempts to retrieve a resource from `resourcePool` or creates a temporary one, executes the task, and returns the resource to the pool (or destroys it).
-3.  **Task Execution**: Workers prioritize tasks from `priorityQueue`, then `mainQueue`. They acquire a resource (which they own for their lifetime, or a temporary one for `RunTask`), execute the task's `run` function, and send results/errors back to the caller via channels embedded in the `Task` struct.
-4.  **Health Checks & Retries**: If a task returns an error and `CheckHealth` indicates an unhealthy state, the worker may be terminated and recreated, and the task re-queued (up to `MaxRetries`).
-5.  **Dynamic Scaling**: The burst manager continuously monitors queue lengths. If tasks accumulate, it instructs the `Runner` to start new burst workers. If queues clear, it signals burst workers to shut down gracefully.
-6.  **Graceful Shutdown (`Stop`)**: The main context is cancelled, signaling all workers and the burst manager to stop processing new tasks. Active tasks are allowed to complete. All resources (worker-owned and pool-based) are destroyed via `OnDestroy`. The system waits for all goroutines to exit before returning.
+    *   Calls to `QueueTask` (and `QueueTaskOnce`) send `*Task[R, E]` instances to the `mainQueue`.
+    *   Calls to `QueueTaskWithPriority` (and `QueueTaskWithPriorityOnce`) send `*Task[R, E]` instances to the `priorityQueue`.
+    *   Calls to `RunTask` first attempt to acquire a resource from the `resourcePool`. If successful, the task is executed directly with that resource. If the pool is empty, a temporary resource is created via `OnCreate`, used for the task, and then destroyed via `OnDestroy`.
+    *   All task submissions are recorded by the `MetricsCollector` to track arrival rates.
+3.  **Task Execution**: Worker goroutines continuously select tasks from the `priorityQueue` (preferentially) or the `mainQueue`. Once a task is acquired, the worker executes the task's `run` function with its dedicated resource. The `MetricsCollector` records task start and completion times.
+4.  **Health Checks & Retries**: If a task execution returns an error, `tasker` invokes the `CheckHealth` function (if provided). If `CheckHealth` returns `false`, indicating an unhealthy state of the worker or its resource, the worker goroutine processing that task is terminated, its resource destroyed (`OnDestroy`), and a new worker is created to replace it. The original task that caused the unhealthy error will then be re-queued (up to `MaxRetries`) to be processed by a newly healthy worker. Tasks submitted via `*Once` methods are not re-queued. Failures and retries are recorded by the `MetricsCollector`.
+5.  **Dynamic Scaling**: The burst manager periodically analyzes the `TaskArrivalRate` versus the `TaskCompletionRate` from the `MetricsCollector`. If demand outstrips capacity, it dynamically starts additional "burst" workers. If demand subsides, it signals idle burst workers to gracefully shut down, optimizing resource usage.
+6.  **Graceful Shutdown (`Stop`)**: When `Stop()` is called, the `Manager` transitions to a "stopping" state, preventing new tasks from being queued. It then cancels its primary `context.Context`, signaling all worker goroutines and the burst manager to stop processing new tasks. Workers in "stopping" mode will first finish processing any tasks remaining in their queues before exiting. `tasker` then waits for all goroutines to complete and drains/destroys all managed resources via `OnDestroy`.
+7.  **Immediate Shutdown (`Kill`)**: When `Kill()` is called, the `Manager` transitions to a "killed" state. It immediately cancels its primary `context.Context`, causing all active worker goroutines to terminate without waiting for tasks to complete. All queued tasks are dropped, and all resources are destroyed.
 
 ### Extension Points
 
-`tasker` is designed to be highly pluggable through its function-based configuration:
+`tasker` is designed to be highly pluggable through its function-based configuration, allowing you to seamlessly integrate it into various application contexts:
 
-*   **`OnCreate func() (R, error)`**: Define how to instantiate your specific resource `R`. This could involve connecting to a database, initializing an external SDK, or setting up a complex object.
-*   **`OnDestroy func(R) error`**: Define how to clean up your resource `R` when a worker shuts down or a temporary resource is no longer needed. This is crucial for releasing connections, closing files, or deallocating memory.
-*   **`CheckHealth func(error) bool`**: Implement custom logic to determine if a task's error indicates an underlying problem with the worker or its resource. Returning `false` here will cause `tasker` to replace the worker and potentially retry the task, enhancing system resilience.
+*   **`OnCreate func() (R, error)`**: This essential function defines how to instantiate your specific resource `R`. This could involve connecting to a database, initializing an external SDK client, setting up a specialized compute object, or any other resource provisioning logic.
+*   **`OnDestroy func(R) error`**: This crucial function defines how to clean up your resource `R` when a worker shuts down, a temporary resource is no longer needed, or the `TaskManager` itself is shutting down. It's vital for releasing connections, closing files, deallocating memory, or performing other necessary resource finalization.
+*   **`CheckHealth func(error) bool`**: Implement custom logic here to determine if a task's returned error indicates an underlying problem with the worker or its resource. Returning `false` from this function will cause `tasker` to consider the worker unhealthy, leading to its replacement and a potential retry of the task, significantly enhancing system resilience.
+*   **`Logger Logger`**: Provide your own implementation of the `tasker.Logger` interface to integrate `tasker`'s internal logging messages with your application's preferred logging framework (e.g., `logrus`, `zap`). The default is a no-op logger.
+*   **`Collector MetricsCollector`**: Supply a custom implementation of the `tasker.MetricsCollector` interface to integrate `tasker`'s rich performance metrics with your existing monitoring and observability stack (e.g., Prometheus, Datadog). A default internal collector is provided if none is specified.
 
 ---
 
 ## Development & Contributing
 
-We welcome contributions to `tasker`!
+We welcome contributions to `tasker`! Whether it's bug reports, feature requests, or code contributions, your input is valuable.
 
 ### Development Setup
+
+To set up your local development environment:
 
 1.  **Clone the repository:**
     ```bash
@@ -690,10 +312,10 @@ All contributions are expected to pass existing tests and maintain a high level 
 We appreciate your interest in contributing! To ensure a smooth contribution process, please follow these guidelines:
 
 1.  **Fork the repository** and create your branch from `main`.
-2.  **Keep your code clean and well-documented.** Follow Go's idiomatic style.
-3.  **Write clear, concise commit messages** that describe your changes.
+2.  **Keep your code clean and well-documented.** Follow Go's idiomatic style and best practices.
+3.  **Write clear, concise commit messages** that describe your changes. We generally follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) (e.g., `feat: add new feature`, `fix: resolve bug`).
 4.  **Ensure your changes are tested.** New features require new tests, and bug fixes should include a test that reproduces the bug.
-5.  **Open a Pull Request** against the `main` branch. Provide a detailed description of your changes.
+5.  **Open a Pull Request** against the `main` branch. Provide a detailed description of your changes, including context, problem solved, and how it was solved.
 
 ### Issue Reporting
 
@@ -713,31 +335,30 @@ When reporting a bug, please include:
 
 ### Troubleshooting
 
-*   **"Task manager is shutting down: cannot queue task"**: This error occurs if you try to `QueueTask` or `RunTask` after `manager.Stop()` has been called or its parent context has been cancelled. Ensure tasks are only submitted while the manager is active.
-*   **Resource Creation Failure**: If your `OnCreate` function returns an error, `tasker` will log it and the associated worker will not start (or a `RunTask` call will fail). Ensure your resource creation logic is robust.
+*   **"Task manager is shutting down: cannot queue task"**: This error occurs if you attempt to `QueueTask`, `QueueTaskWithPriority`, `QueueTaskOnce`, `QueueTaskWithPriorityOnce`, or `RunTask` after `manager.Stop()` or `manager.Kill()` has been called, or if the `Ctx` provided during `NewTaskManager` initialization has been cancelled. Ensure tasks are only submitted while the manager is actively running.
+*   **Resource Creation Failure**: If your `OnCreate` function returns an error, `tasker` will log it, and the associated worker will not start (or a `RunTask` call will fail). Ensure your resource creation logic is robust and handles transient issues gracefully.
 *   **Workers Not Starting/Stopping as Expected**:
-    *   Check your `WorkerCount` and `MaxWorkerCount` settings.
-    *   For bursting, ensure `BurstTaskThreshold`, `BurstWorkerCount`, and `BurstInterval` are correctly configured.
-    *   Verify your `Ctx` and `cancel` functions are being managed correctly, especially for graceful shutdown.
-    *   Review `CheckHealth` logic; an incorrect implementation might cause workers to constantly recreate.
-*   **Deadlocks/Goroutine Leaks**: While `tasker` is designed to prevent these, improper usage (e.g., blocking in `OnCreate`/`OnDestroy`, or not using buffered channels for task results outside the library) can lead to issues. Always ensure your custom functions (`OnCreate`, `OnDestroy`, task functions) don't block indefinitely.
+    *   Verify your `WorkerCount` and `MaxWorkerCount` settings in `tasker.Config`.
+    *   For dynamic scaling (bursting), ensure `BurstInterval` is configured and not set to 0.
+    *   Check that your main `context.Context` (passed as `Ctx` in `Config`) and its `cancel` function are managed correctly, especially for graceful shutdown scenarios.
+    *   Review your `CheckHealth` logic; an incorrect implementation might lead to workers constantly restarting (thrashing) or not restarting when they should.
+*   **Deadlocks/Goroutine Leaks**: While `tasker` is designed to prevent these within its core logic, improper usage (e.g., blocking indefinitely within your `OnCreate`, `OnDestroy`, or task functions, or not using buffered channels for task results outside the library) can lead to such issues. Always ensure your custom functions (`OnCreate`, `OnDestroy`, `taskFunc`) do not block indefinitely.
 
 ### FAQ
 
 *   **When should I use `QueueTask` vs. `RunTask`?**
-    *   Use `QueueTask` for asynchronous, background tasks that can wait in a queue for an available worker. Ideal for high-throughput, batch processing.
-    *   Use `RunTask` for synchronous, immediate tasks that require low latency and might need a resource right away, bypassing the queues. It's suitable for user-facing requests or critical operations that can't afford queueing delay.
-*   **How does `CheckHealth` affect workers?**
-    *   If `CheckHealth` returns `false` for an error, `tasker` considers the worker (or its resource) to be in an unhealthy state. This worker will be shut down, its resource destroyed (`OnDestroy`), and a new worker will be created to replace it. The original task that caused the unhealthy error will also be re-queued (up to `MaxRetries`).
+    *   Use `QueueTask` (or `QueueTaskWithPriority`) for asynchronous, background tasks that can wait in a queue for an available worker. This is ideal for high-throughput, batch processing, or any operation where immediate synchronous completion isn't strictly necessary.
+    *   Use `RunTask` for synchronous, immediate tasks that require low latency and might need a resource right away, bypassing the queues. It's suitable for user-facing requests or critical operations that can't afford any queuing delay, such as generating a quick preview.
+*   **How does `CheckHealth` affect workers and tasks?**
+    *   If `CheckHealth` returns `false` for an error returned by a task, `tasker` considers the worker (or its underlying resource) to be in an unhealthy state. This unhealthy worker will be gracefully shut down, its resource destroyed (`OnDestroy`), and a new worker will be created to replace it. The original task that caused the unhealthy error will also be re-queued (up to `MaxRetries`) to be processed by a newly healthy worker. If `CheckHealth` returns `true` (or is `nil`), the error is considered a task-specific failure, not a worker health issue, and the worker continues operating.
 *   **What happens if a task panics?**
-    *   It is generally recommended that your task functions (the `func(R) (E, error)` you pass to `QueueTask` etc.) recover from panics and return an error instead. If a panic occurs and is not recovered within the task, it will crash the worker goroutine. While `tasker` will attempt to replace the worker, unhandled panics can lead to unexpected behavior and resource leaks.
+    *   It is generally recommended that your task functions (the `func(R) (E, error)` you pass to `QueueTask` etc.) internally recover from panics and convert them into errors. If a panic occurs and is *not* recovered within the task function itself, it will crash the specific worker goroutine that was executing it. While `tasker` will detect the worker's exit and attempt to replace it, unhandled panics can lead to unexpected behavior, lost task results, and potential resource leaks if `OnDestroy` is not called due to an abrupt exit.
 *   **Is `tasker` suitable for long-running tasks?**
-    *   Yes, `tasker` can handle long-running tasks. However, be mindful of the `Ctx` passed to `NewRunner`. If that context is cancelled, all workers will attempt to gracefully shut down, potentially interrupting very long tasks. For indefinite tasks, consider separate Goroutines outside of `tasker` or ensure a very long-lived context.
+    *   Yes, `tasker` can handle long-running tasks. However, be mindful of the parent `context.Context` passed to `NewTaskManager`. If that context is cancelled, all workers will attempt to gracefully shut down, potentially interrupting very long tasks. For indefinite tasks, consider managing them using separate Goroutines outside of `tasker` or ensure a very long-lived context for your `TaskManager` instance.
 
 ### Changelog / Roadmap
 
-*   [**CHANGELOG.md**](CHANGELOG.md): See the project's history of changes.
-*   **Roadmap**: Future plans may include deeper metrics integration (e.g., Prometheus exporters), more sophisticated queuing strategies, and enhanced observability features.
+*   [**CHANGELOG.md**](CHANGELOG.md): See the project's history of changes and version releases.
 
 ### License
 
@@ -745,4 +366,4 @@ When reporting a bug, please include:
 
 ### Acknowledgments
 
-This project is inspired by common worker pool patterns and the need for robust, flexible concurrency management in modern Go applications.
+This project is inspired by common worker pool patterns and the need for robust, flexible concurrency management in modern Go applications. It aims to provide a reliable foundation for building scalable backend services.

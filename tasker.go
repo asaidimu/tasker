@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,6 +79,9 @@ type TaskManager[R any, E any] interface {
 	// Stats returns current statistics about the task manager's operational state.
 	// This includes information on worker counts, queued tasks, and resource availability.
 	Stats() TaskStats
+
+	// Metrics returns a snapshot of the currently aggregated performance metrics.
+	Metrics() TaskMetrics
 }
 
 // TaskStats provides insight into the task manager's current state and performance.
@@ -96,10 +100,11 @@ type TaskStats struct {
 type Task[R any, E any] struct {
 	// The actual function representing the task's logic.
 	// R is the resource type itself (e.g., *DatabaseConnection).
-	run     func(R) (E, error)
-	result  chan E      // Channel to send the task's successful result.
-	err     chan error  // Channel to send any error encountered during task execution.
-	retries int         // Current number of retries attempted for this task.
+	run      func(R) (E, error)
+	result   chan E     // Channel to send the task's successful result.
+	err      chan error // Channel to send any error encountered during task execution.
+	retries  int        // Current number of retries attempted for this task.
+	queuedAt time.Time  // Timestamp when the task was queued.
 }
 
 // Config holds configuration parameters for creating a new Runner instance.
@@ -131,17 +136,8 @@ type Config[R any] struct {
 	// If nil, all errors are considered healthy (i.e., not cause for worker termination).
 	CheckHealth func(error) bool
 
-	// BurstTaskThreshold is the queue size (mainQueue + priorityQueue) that triggers the creation of burst workers.
-	// If total queued tasks exceed this value, new burst workers will be spun up.
-	// If 0, burst scaling is disabled.
-	BurstTaskThreshold int
-
-	// BurstWorkerCount is the number of burst workers to create when the BurstTaskThreshold is exceeded.
-	// If 0, burst scaling is disabled. Defaults to 2.
-	BurstWorkerCount int
-
 	// MaxWorkerCount is the maximum total number of workers (base + burst) allowed.
-	// If 0, it defaults to WorkerCount + BurstWorkerCount.
+	// If 0, it defaults to WorkerCount * 2.
 	MaxWorkerCount int
 
 	// BurstInterval is the frequency at which the burst manager checks queue sizes
@@ -158,15 +154,25 @@ type Config[R any] struct {
 	// in the internal pool for `RunTask` operations.
 	// If 0, a default of `WorkerCount` is used.
 	ResourcePoolSize int
+
+	// Optional: Custom logger interface for internal messages
+	Logger Logger
+
+	// Optional: Custom metrics collector
+	Collector MetricsCollector
+	// Deprecated
+	BurstTaskThreshold int
+	// Deprecated
+	BurstWorkerCount int
 }
 
-// Runner implements the TaskManager interface, providing a highly concurrent
+// Manager implements the TaskManager interface, providing a highly concurrent
 // and scalable task execution environment. It manages a pool of workers,
 // handles task queuing (main and priority), supports dynamic worker scaling (bursting),
 // and includes a resource pool for immediate task execution.
 // R is the type of resource used by tasks (e.g., *sql.DB, *http.Client).
 // E is the expected result type of the tasks.
-type Runner[R any, E any] struct {
+type Manager[R any, E any] struct {
 	// shutdownState represents the current lifecycle state of the Runner
 	shutdownState struct {
 		// Constants for shutdown state management - encapsulated within Runner
@@ -183,13 +189,11 @@ type Runner[R any, E any] struct {
 	maxRetries  int               // Maximum number of retries for a task on unhealthy errors.
 
 	// Worker management
-	baseWorkerCount     int32           // The fixed number of base workers.
-	activeWorkers       atomic.Int32    // Atomically counts all currently active workers (base + burst).
-	burstWorkers        atomic.Int32    // Atomically counts currently active burst workers.
-	burstTaskThreshold  int
-	burstWorkerCount    int
-	maxWorkerCount      int             // Maximum total workers allowed.
-	burstInterval       time.Duration   // Interval for burst manager to check queues.
+	baseWorkerCount int32         // The fixed number of base workers.
+	activeWorkers   atomic.Int32  // Atomically counts all currently active workers (base + burst).
+	burstWorkers    atomic.Int32  // Atomically counts currently active burst workers.
+	maxWorkerCount  int           // Maximum total workers allowed.
+	burstInterval   time.Duration // Interval for burst manager to check queues.
 
 	// Task queues (using channels for efficient communication)
 	mainQueue     chan *Task[R, E] // Main queue for standard tasks.
@@ -205,10 +209,10 @@ type Runner[R any, E any] struct {
 	wg     sync.WaitGroup     // Used to wait for all goroutines (workers, managers) to complete.
 
 	// Burst management
-	burstMu     sync.Mutex             // Protects access to burst-related fields like burstCtxs.
-	burstCtxs   []context.CancelFunc   // Stores cancel functions for burst workers to stop them gracefully.
-	burstTicker *time.Ticker           // Ticker for the burst manager's periodic checks.
-	burstStop   chan struct{}          // Signal channel to stop the burst manager goroutine.
+	burstMu     sync.Mutex           // Protects access to burst-related fields like burstCtxs.
+	burstCtxs   []context.CancelFunc // Stores cancel functions for burst workers to stop them gracefully.
+	burstTicker *time.Ticker         // Ticker for the burst manager's periodic checks.
+	burstStop   chan struct{}        // Signal channel to stop the burst manager goroutine.
 
 	// Statistics - using individual atomic values for better performance
 	queuedTasks        atomic.Int32 // Number of tasks currently in the main queue.
@@ -219,12 +223,23 @@ type Runner[R any, E any] struct {
 	utils struct {
 		taskResultTimeout time.Duration // Timeout for sending task results back to callers
 	}
+
+	// Logger for internal messages
+	logger Logger
+
+	// Metrics collector
+	collector MetricsCollector
 }
 
-// NewRunner creates and initializes a new Runner instance based on the provided configuration.
+// Deprecated. Use NewTaskManager instead
+func NewRunner[R any, E any](config Config[R]) (TaskManager[R, E], error) {
+	return NewTaskManager[R, E](config)
+}
+
+// NewTaskManager creates and initializes a new Runner instance based on the provided configuration.
 // It sets up the resource pool, starts the base workers, and kicks off the burst manager.
 // Returns a TaskManager interface and an error if initialization fails (e.g., invalid config, resource creation error).
-func NewRunner[R any, E any](config Config[R]) (TaskManager[R, E], error) {
+func NewTaskManager[R any, E any](config Config[R]) (TaskManager[R, E], error) {
 	if config.WorkerCount <= 0 {
 		return nil, errors.New("worker count must be positive")
 	}
@@ -234,11 +249,8 @@ func NewRunner[R any, E any](config Config[R]) (TaskManager[R, E], error) {
 	if config.OnDestroy == nil {
 		return nil, errors.New("onDestroy function is required")
 	}
-	if config.BurstWorkerCount <= 0 {
-		config.BurstWorkerCount = 2 // Default value
-	}
 	if config.MaxWorkerCount <= 0 {
-		config.MaxWorkerCount = config.WorkerCount + config.BurstWorkerCount // Default value
+		config.MaxWorkerCount = config.WorkerCount * 2 // Default value
 	}
 	if config.CheckHealth == nil {
 		config.CheckHealth = func(error) bool { return true }
@@ -253,27 +265,36 @@ func NewRunner[R any, E any](config Config[R]) (TaskManager[R, E], error) {
 		config.BurstInterval = 100 * time.Millisecond
 	}
 
+	if config.Logger == nil {
+		config.Logger = newNoOpLogger()
+	}
+
+	if config.Collector == nil {
+		config.Collector = NewCollector()
+	}
+
 	ctx, cancel := context.WithCancel(config.Ctx)
 
-	runner := &Runner[R, E]{
-		onCreate:            config.OnCreate,
-		onDestroy:           config.OnDestroy,
-		baseWorkerCount:     int32(config.WorkerCount),
-		checkHealth:         config.CheckHealth,
-		maxRetries:          config.MaxRetries,
-		burstTaskThreshold:  config.BurstTaskThreshold,
-		burstWorkerCount:    config.BurstWorkerCount,
-		maxWorkerCount:      config.MaxWorkerCount,
-		burstInterval:       config.BurstInterval,
-		mainQueue:           make(chan *Task[R, E], config.WorkerCount*2),
-		priorityQueue:       make(chan *Task[R, E], config.WorkerCount),
-		resourcePool:        make(chan R, config.ResourcePoolSize),
-		poolSize:            config.ResourcePoolSize,
-		ctx:                 ctx,
-		cancel:              cancel,
-		burstStop:           make(chan struct{}),
-		burstCtxs:           make([]context.CancelFunc, 0),
+	runner := &Manager[R, E]{
+		onCreate:        config.OnCreate,
+		onDestroy:       config.OnDestroy,
+		baseWorkerCount: int32(config.WorkerCount),
+		checkHealth:     config.CheckHealth,
+		maxRetries:      config.MaxRetries,
+		maxWorkerCount:  config.MaxWorkerCount,
+		burstInterval:   config.BurstInterval,
+		mainQueue:       make(chan *Task[R, E], config.WorkerCount*2),
+		priorityQueue:   make(chan *Task[R, E], config.WorkerCount),
+		resourcePool:    make(chan R, config.ResourcePoolSize),
+		poolSize:        config.ResourcePoolSize,
+		ctx:             ctx,
+		cancel:          cancel,
+		burstStop:       make(chan struct{}),
+		burstCtxs:       make([]context.CancelFunc, 0),
+		logger:          config.Logger,
+		collector:       config.Collector,
 	}
+	runner.logger.Infof("TaskManager created with %d base workers.", runner.baseWorkerCount)
 
 	// Initialize encapsulated state constants
 	runner.shutdownState.running = 0
@@ -285,6 +306,7 @@ func NewRunner[R any, E any](config Config[R]) (TaskManager[R, E], error) {
 	runner.utils.taskResultTimeout = 100 * time.Millisecond
 
 	if err := runner.initializeResourcePool(); err != nil {
+		runner.logger.Errorf("Failed to initialize resource pool: %v", err)
 		cancel()
 		return nil, fmt.Errorf("failed to initialize resource pool: %w", err)
 	}
@@ -299,32 +321,22 @@ func NewRunner[R any, E any](config Config[R]) (TaskManager[R, E], error) {
 }
 
 // isRunning checks if the runner is in running state
-func (r *Runner[R, E]) isRunning() bool {
+func (r *Manager[R, E]) isRunning() bool {
 	return r.shutdownState.current.Load() == r.shutdownState.running
 }
 
 // isStopping checks if the runner is in stopping state
-func (r *Runner[R, E]) isStopping() bool {
+func (r *Manager[R, E]) isStopping() bool {
 	return r.shutdownState.current.Load() == r.shutdownState.stopping
 }
 
-// isKilled checks if the runner is in killed state
-func (r *Runner[R, E]) isKilled() bool {
-	return r.shutdownState.current.Load() == r.shutdownState.killed
-}
-
 // transitionState atomically transitions from one state to another
-func (r *Runner[R, E]) transitionState(from, to int32) bool {
+func (r *Manager[R, E]) transitionState(from, to int32) bool {
 	return r.shutdownState.current.CompareAndSwap(from, to)
 }
 
-// getCurrentState returns the current shutdown state
-func (r *Runner[R, E]) getCurrentState() int32 {
-	return r.shutdownState.current.Load()
-}
-
 // minInt returns the minimum of two integers - encapsulated utility
-func (r *Runner[R, E]) minInt(a, b int) int {
+func (r *Manager[R, E]) minInt(a, b int) int {
 	if a < b {
 		return a
 	}
@@ -332,7 +344,7 @@ func (r *Runner[R, E]) minInt(a, b int) int {
 }
 
 // maxInt returns the maximum of two integers - encapsulated utility
-func (r *Runner[R, E]) maxInt(a, b int) int {
+func (r *Manager[R, E]) maxInt(a, b int) int {
 	if a > b {
 		return a
 	}
@@ -340,7 +352,8 @@ func (r *Runner[R, E]) maxInt(a, b int) int {
 }
 
 // initializeResourcePool pre-allocates and populates the resource pool.
-func (r *Runner[R, E]) initializeResourcePool() error {
+func (r *Manager[R, E]) initializeResourcePool() error {
+	r.logger.Debugf("Initializing resource pool with size %d.", r.poolSize)
 	for range r.poolSize {
 		resource, err := r.onCreate()
 		if err != nil {
@@ -356,35 +369,47 @@ func (r *Runner[R, E]) initializeResourcePool() error {
 			return r.ctx.Err()
 		}
 	}
+	r.logger.Infof("Resource pool initialized successfully.")
 	return nil
 }
 
 // drainResourcePool cleans up all resources currently held within the resource pool.
-func (r *Runner[R, E]) drainResourcePool() {
+func (r *Manager[R, E]) drainResourcePool() {
+	r.logger.Debugf("Draining resource pool.")
 	close(r.resourcePool)
 	for resource := range r.resourcePool {
-		_ = r.onDestroy(resource) // Log errors in a real app
+		if err := r.onDestroy(resource); err != nil {
+			r.logger.Warnf("Error destroying resource: %v", err)
+		}
 		r.availableResources.Add(-1)
 	}
+	r.logger.Infof("Resource pool drained.")
 }
 
 // startWorker creates and launches a new worker goroutine.
-func (r *Runner[R, E]) startWorker(ctx context.Context, isBurst bool) {
+func (r *Manager[R, E]) startWorker(ctx context.Context, isBurst bool) {
 	r.wg.Add(1)
 	go r.worker(ctx, isBurst)
+	r.logger.Debugf("Started a new worker (isBurst: %t).", isBurst)
 }
 
 // worker is the main loop for a worker goroutine.
 // It processes tasks until the context is canceled, at which point it either
 // drains the queues (for graceful stop) or exits immediately (for kill).
-func (r *Runner[R, E]) worker(ctx context.Context, isBurst bool) {
+func (r *Manager[R, E]) worker(ctx context.Context, isBurst bool) {
 	defer r.wg.Done()
+	r.logger.Debugf("Worker started.")
 
 	resource, err := r.onCreate()
 	if err != nil {
+		r.logger.Errorf("Worker failed to create resource: %v", err)
 		return // Cannot start worker without a resource
 	}
-	defer func() { _ = r.onDestroy(resource) }()
+	defer func() {
+		if err := r.onDestroy(resource); err != nil {
+			r.logger.Warnf("Error destroying resource on worker exit: %v", err)
+		}
+	}()
 
 	if isBurst {
 		r.burstWorkers.Add(1)
@@ -396,22 +421,30 @@ func (r *Runner[R, E]) worker(ctx context.Context, isBurst bool) {
 	for {
 		select {
 		case <-ctx.Done():
+			r.logger.Debugf("Worker received context cancellation signal.")
 			// Context is canceled. Check if this is a graceful stop.
 			if r.isStopping() {
+				r.logger.Infof("Worker entering drain mode.")
 				// Graceful stop: drain all queues before exiting.
 				for r.processQueues(resource) {
 				}
+				r.logger.Infof("Worker finished draining queues.")
 			}
 			// For kill, or after draining is complete, exit immediately.
+			r.logger.Debugf("Worker exiting.")
 			return
 		case task := <-r.priorityQueue:
 			r.priorityTasks.Add(-1)
+			r.logger.Debugf("Worker picked up a priority task.")
 			if !r.executeTask(task, resource) {
+				r.logger.Warnf("Unhealthy worker is exiting.")
 				return // Unhealthy worker exits
 			}
 		case task := <-r.mainQueue:
 			r.queuedTasks.Add(-1)
+			r.logger.Debugf("Worker picked up a main queue task.")
 			if !r.executeTask(task, resource) {
+				r.logger.Warnf("Unhealthy worker is exiting.")
 				return // Unhealthy worker exits
 			}
 		}
@@ -420,14 +453,16 @@ func (r *Runner[R, E]) worker(ctx context.Context, isBurst bool) {
 
 // processQueues tries to process one task from either queue. Used for draining.
 // Returns true if a task was processed, false if queues were empty.
-func (r *Runner[R, E]) processQueues(resource R) bool {
+func (r *Manager[R, E]) processQueues(resource R) bool {
 	select {
 	case task := <-r.priorityQueue:
 		r.priorityTasks.Add(-1)
+		r.logger.Debugf("Draining: processing priority task.")
 		r.executeTask(task, resource)
 		return true
 	case task := <-r.mainQueue:
 		r.queuedTasks.Add(-1)
+		r.logger.Debugf("Draining: processing main queue task.")
 		r.executeTask(task, resource)
 		return true
 	default:
@@ -436,22 +471,45 @@ func (r *Runner[R, E]) processQueues(resource R) bool {
 }
 
 // executeTask runs a single task and handles its retry logic.
-func (r *Runner[R, E]) executeTask(task *Task[R, E], resource R) bool {
+func (r *Manager[R, E]) executeTask(task *Task[R, E], resource R) bool {
+	startedAt := time.Now()
+	r.logger.Debugf("Executing task (retries: %d).", task.retries)
 	result, err := task.run(resource)
+	finishedAt := time.Now()
 
-	if err != nil && !r.checkHealth(err) {
-		if task.retries < r.maxRetries {
-			task.retries++
-			select {
-			case r.priorityQueue <- task:
-				r.priorityTasks.Add(1)
-			default:
-				r.sendTaskResult(task, result, fmt.Errorf("priority queue full, task requeue failed: %w", err))
+	timestamps := TaskLifecycleTimestamps{
+		QueuedAt:   task.queuedAt,
+		StartedAt:  startedAt,
+		FinishedAt: finishedAt,
+	}
+
+	if err != nil {
+		r.logger.Warnf("Task execution failed: %v", err)
+		if !r.checkHealth(err) {
+			r.logger.Warnf("Unhealthy state detected after task failure.")
+			if task.retries < r.maxRetries {
+				task.retries++
+				r.logger.Infof("Re-queuing task (retry %d/%d).", task.retries, r.maxRetries)
+				r.collector.RecordRetry()
+				select {
+				case r.priorityQueue <- task:
+					r.priorityTasks.Add(1)
+				default:
+					r.logger.Errorf("Priority queue full, task requeue failed: %v", err)
+					r.collector.RecordFailure(timestamps)
+					r.sendTaskResult(task, result, fmt.Errorf("priority queue full, task requeue failed: %w", err))
+				}
+			} else {
+				r.logger.Errorf("Max retries exceeded for task: %v", err)
+				r.collector.RecordFailure(timestamps)
+				r.sendTaskResult(task, result, fmt.Errorf("max retries exceeded: %w", err))
 			}
-		} else {
-			r.sendTaskResult(task, result, fmt.Errorf("max retries exceeded: %w", err))
+			return false // Worker is unhealthy
 		}
-		return false // Worker is unhealthy
+		r.collector.RecordFailure(timestamps)
+	} else {
+		r.logger.Debugf("Task executed successfully.")
+		r.collector.RecordCompletion(timestamps)
 	}
 
 	r.sendTaskResult(task, result, err)
@@ -459,7 +517,8 @@ func (r *Runner[R, E]) executeTask(task *Task[R, E], resource R) bool {
 }
 
 // sendTaskResult safely sends the task result and error back to the caller.
-func (r *Runner[R, E]) sendTaskResult(task *Task[R, E], result E, err error) {
+func (r *Manager[R, E]) sendTaskResult(task *Task[R, E], result E, err error) {
+	r.logger.Debugf("Sending task result.")
 	// Non-blocking send with a short timeout to prevent being stuck forever
 	ctx, cancel := context.WithTimeout(context.Background(), r.utils.taskResultTimeout)
 	defer cancel()
@@ -467,33 +526,40 @@ func (r *Runner[R, E]) sendTaskResult(task *Task[R, E], result E, err error) {
 	select {
 	case task.err <- err:
 	case <-ctx.Done():
+		r.logger.Warnf("Timeout sending task error result.")
 	}
 
 	select {
 	case task.result <- result:
 	case <-ctx.Done():
+		r.logger.Warnf("Timeout sending task success result.")
 	}
 }
 
 // QueueTask adds a task to the main queue for asynchronous processing.
-func (r *Runner[R, E]) QueueTask(taskFunc func(R) (E, error)) (E, error) {
+func (r *Manager[R, E]) QueueTask(taskFunc func(R) (E, error)) (E, error) {
 	if !r.isRunning() {
 		var zero E
+		r.logger.Warnf("Attempted to queue task while shutting down.")
 		return zero, errors.New("task manager is shutting down")
 	}
 
 	task := &Task[R, E]{
-		run:    taskFunc,
-		result: make(chan E, 1),
-		err:    make(chan error, 1),
+		run:      taskFunc,
+		result:   make(chan E, 1),
+		err:      make(chan error, 1),
+		queuedAt: time.Now(),
 	}
 
+	r.collector.RecordArrival()
 	select {
 	case r.mainQueue <- task:
 		r.queuedTasks.Add(1)
+		r.logger.Debugf("Task added to the main queue.")
 		return <-task.result, <-task.err
 	case <-r.ctx.Done():
 		var zero E
+		r.logger.Warnf("Attempted to queue task while shutting down (context done).")
 		return zero, errors.New("task manager is shutting down")
 	}
 }
@@ -504,82 +570,97 @@ func (r *Runner[R, E]) QueueTask(taskFunc func(R) (E, error)) (E, error) {
 // non-idempotent operations.
 // It returns the result and error of the task once it completes.
 // If the task manager is shutting down, it returns an error immediately.
-func (r *Runner[R, E]) QueueTaskOnce(taskFunc func(R) (E, error)) (E, error) {
+func (r *Manager[R, E]) QueueTaskOnce(taskFunc func(R) (E, error)) (E, error) {
 	if !r.isRunning() {
 		var zero E
+		r.logger.Warnf("Attempted to queue a 'once' task while shutting down.")
 		return zero, errors.New("task manager is shutting down")
 	}
 
 	task := &Task[R, E]{
-		run:    taskFunc,
-		result: make(chan E, 1),
-		err:    make(chan error, 1),
-		retries: r.maxRetries, // Set retries to max so it won't retry on health failure
+		run:      taskFunc,
+		result:   make(chan E, 1),
+		err:      make(chan error, 1),
+		retries:  r.maxRetries, // Set retries to max so it won't retry on health failure
+		queuedAt: time.Now(),
 	}
 
+	r.collector.RecordArrival()
 	select {
 	case r.mainQueue <- task:
 		r.queuedTasks.Add(1)
+		r.logger.Debugf("Task (once) added to the main queue.")
 		return <-task.result, <-task.err
 	case <-r.ctx.Done():
 		var zero E
+		r.logger.Warnf("Attempted to queue a 'once' task while shutting down (context done).")
 		return zero, errors.New("task manager is shutting down")
 	}
 }
 
-
 // QueueTaskWithPriority adds a high-priority task to the priority queue.
-func (r *Runner[R, E]) QueueTaskWithPriority(taskFunc func(R) (E, error)) (E, error) {
+func (r *Manager[R, E]) QueueTaskWithPriority(taskFunc func(R) (E, error)) (E, error) {
 	if !r.isRunning() {
 		var zero E
+		r.logger.Warnf("Attempted to queue priority task while shutting down.")
 		return zero, errors.New("task manager is shutting down")
 	}
 
 	task := &Task[R, E]{
-		run:    taskFunc,
-		result: make(chan E, 1),
-		err:    make(chan error, 1),
+		run:      taskFunc,
+		result:   make(chan E, 1),
+		err:      make(chan error, 1),
+		queuedAt: time.Now(),
 	}
 
+	r.collector.RecordArrival()
 	select {
 	case r.priorityQueue <- task:
 		r.priorityTasks.Add(1)
+		r.logger.Debugf("Task added to the priority queue.")
 		return <-task.result, <-task.err
 	case <-r.ctx.Done():
 		var zero E
+		r.logger.Warnf("Attempted to queue priority task while shutting down (context done).")
 		return zero, errors.New("task manager is shutting down")
 	}
 }
 
 // QueueTaskWithPriority adds a high-priority task to the priority queue, but
 // the task will not be retried.
-func (r *Runner[R, E]) QueueTaskWithPriorityOnce(taskFunc func(R) (E, error)) (E, error) {
- 	if !r.isRunning() {
- 		var zero E
- 		return zero, errors.New("task manager is shutting down")
- 	}
-
- 	task := &Task[R, E]{
- 		run:    taskFunc,
- 		result: make(chan E, 1),
- 		err:    make(chan error, 1),
- 		retries: r.maxRetries, // Set retries to max so it won't retry on health failure
- 	}
-
- 	select {
- 	case r.priorityQueue <- task:
- 		r.priorityTasks.Add(1)
- 		return <-task.result, <-task.err
- 	case <-r.ctx.Done():
- 		var zero E
- 		return zero, errors.New("task manager is shutting down")
- 	}
- }
-
-// RunTask executes a task immediately using a resource from the pool.
-func (r *Runner[R, E]) RunTask(taskFunc func(R) (E, error)) (E, error) {
+func (r *Manager[R, E]) QueueTaskWithPriorityOnce(taskFunc func(R) (E, error)) (E, error) {
 	if !r.isRunning() {
 		var zero E
+		r.logger.Warnf("Attempted to queue a 'once' priority task while shutting down.")
+		return zero, errors.New("task manager is shutting down")
+	}
+
+	task := &Task[R, E]{
+		run:      taskFunc,
+		result:   make(chan E, 1),
+		err:      make(chan error, 1),
+		retries:  r.maxRetries, // Set retries to max so it won't retry on health failure
+		queuedAt: time.Now(),
+	}
+
+	r.collector.RecordArrival()
+	select {
+	case r.priorityQueue <- task:
+		r.priorityTasks.Add(1)
+		r.logger.Debugf("Task (once) added to the priority queue.")
+		return <-task.result, <-task.err
+	case <-r.ctx.Done():
+		var zero E
+		r.logger.Warnf("Attempted to queue a 'once' priority task while shutting down (context done).")
+		return zero, errors.New("task manager is shutting down")
+	}
+}
+
+// RunTask executes a task immediately using a resource from the pool.
+func (r *Manager[R, E]) RunTask(taskFunc func(R) (E, error)) (E, error) {
+	if !r.isRunning() {
+		var zero E
+		r.logger.Warnf("Attempted to run task while shutting down.")
 		return zero, errors.New("task manager is shutting down")
 	}
 
@@ -587,20 +668,31 @@ func (r *Runner[R, E]) RunTask(taskFunc func(R) (E, error)) (E, error) {
 	var err error
 	fromPool := false
 
+	// Record metric for arrival
+	r.collector.RecordArrival()
+
+	queuedAt := time.Now()
+
 	select {
 	case resource = <-r.resourcePool:
 		fromPool = true
 		r.availableResources.Add(-1)
+		r.logger.Debugf("Acquired resource from pool for RunTask.")
 	case <-r.ctx.Done():
 		var zero E
+		r.logger.Warnf("Attempted to run task while shutting down (context done).")
 		return zero, errors.New("task manager is shutting down")
 	default:
+		r.logger.Debugf("Creating temporary resource for RunTask.")
 		resource, err = r.onCreate()
 		if err != nil {
 			var zero E
+			r.logger.Errorf("Failed to create temporary resource for RunTask: %v", err)
 			return zero, fmt.Errorf("failed to create temporary resource: %w", err)
 		}
 	}
+
+	startedAt := time.Now()
 
 	defer func() {
 		if fromPool {
@@ -608,23 +700,44 @@ func (r *Runner[R, E]) RunTask(taskFunc func(R) (E, error)) (E, error) {
 				select {
 				case r.resourcePool <- resource:
 					r.availableResources.Add(1)
+					r.logger.Debugf("Returned resource to pool after RunTask.")
 				default:
+					r.logger.Warnf("Could not return resource to full pool; destroying it.")
 					_ = r.onDestroy(resource) // Pool full, destroy
 				}
 			} else {
+				r.logger.Debugf("Destroying pooled resource on shutdown.")
 				_ = r.onDestroy(resource) // Shutting down, destroy
 			}
 		} else {
+			r.logger.Debugf("Destroying temporary resource after RunTask.")
 			_ = r.onDestroy(resource) // Always destroy temporary
 		}
 	}()
 
-	return taskFunc(resource)
+	r.logger.Debugf("Executing RunTask.")
+	result, err := taskFunc(resource)
+	finishedAt := time.Now()
+
+	timestamps := TaskLifecycleTimestamps{
+		QueuedAt:   queuedAt,
+		StartedAt:  startedAt,
+		FinishedAt: finishedAt,
+	}
+
+	if err != nil {
+		r.collector.RecordFailure(timestamps)
+	} else {
+		r.collector.RecordCompletion(timestamps)
+	}
+
+	return result, err
 }
 
 // startBurstManager starts the dynamic worker scaling manager.
-func (r *Runner[R, E]) startBurstManager() {
-	if r.burstTaskThreshold <= 0 || r.burstWorkerCount <= 0 {
+func (r *Manager[R, E]) startBurstManager() {
+	if r.burstInterval <= 0 {
+		r.logger.Infof("Burst scaling is disabled.")
 		return
 	}
 
@@ -633,11 +746,14 @@ func (r *Runner[R, E]) startBurstManager() {
 	go func() {
 		defer r.wg.Done()
 		defer r.burstTicker.Stop()
+		r.logger.Infof("Burst manager started.")
 		for {
 			select {
 			case <-r.ctx.Done():
+				r.logger.Infof("Burst manager stopping due to context cancellation.")
 				return
 			case <-r.burstStop:
+				r.logger.Infof("Burst manager stopping.")
 				return
 			case <-r.burstTicker.C:
 				r.manageBurst()
@@ -647,38 +763,69 @@ func (r *Runner[R, E]) startBurstManager() {
 }
 
 // manageBurst handles the logic for scaling workers up or down.
-func (r *Runner[R, E]) manageBurst() {
+func (r *Manager[R, E]) manageBurst() {
 	r.burstMu.Lock()
 	defer r.burstMu.Unlock()
 
-	totalQueued := int(r.queuedTasks.Load() + r.priorityTasks.Load())
-	currentActiveWorkers := int(r.activeWorkers.Load())
-	currentBurstWorkers := int(r.burstWorkers.Load())
+	metrics := r.collector.Metrics()
+	stats := r.Stats()
 
-	if totalQueued > r.burstTaskThreshold {
-		canAdd := r.maxWorkerCount - currentActiveWorkers
-		wantToAdd := r.burstWorkerCount
-		maxUseful := totalQueued - r.burstTaskThreshold
-		toAdd := r.minInt(wantToAdd, r.minInt(canAdd, maxUseful))
+	if stats.ActiveWorkers == 0 {
+		return // Avoid division by zero
+	}
 
-		for range toAdd {
+	// Calculate throughput per worker
+	throughputPerWorker := metrics.TaskCompletionRate / float64(stats.ActiveWorkers)
+
+	if throughputPerWorker == 0 && metrics.TaskArrivalRate > 0 {
+		// If there is no throughput but tasks are arriving, we need to scale up.
+		// Add a single worker to get the process started.
+		if stats.ActiveWorkers < int32(r.maxWorkerCount) {
+			r.logger.Infof("Scaling up: adding a burst worker due to zero throughput.")
 			burstCtx, cancel := context.WithCancel(r.ctx)
 			r.burstCtxs = append(r.burstCtxs, cancel)
 			r.startWorker(burstCtx, true)
 		}
-	} else if totalQueued < r.burstTaskThreshold/2 && currentBurstWorkers > 0 {
-		toRemove := r.minInt(currentBurstWorkers, r.maxInt(1, currentBurstWorkers/2))
-		for i := 0; i < toRemove && len(r.burstCtxs) > 0; i++ {
-			lastIdx := len(r.burstCtxs) - 1
-			cancel := r.burstCtxs[lastIdx]
-			cancel()
-			r.burstCtxs = r.burstCtxs[:lastIdx]
+		return
+	}
+
+	if metrics.TaskArrivalRate > metrics.TaskCompletionRate {
+		// System is falling behind
+		throughputDeficit := metrics.TaskArrivalRate - metrics.TaskCompletionRate
+		workersToAdd := int(math.Ceil(throughputDeficit / throughputPerWorker))
+
+		canAdd := r.maxWorkerCount - int(stats.ActiveWorkers)
+		toAdd := r.minInt(workersToAdd, canAdd)
+
+		if toAdd > 0 {
+			r.logger.Infof("Scaling up: adding %d burst workers to meet demand.", toAdd)
+			for range toAdd {
+				burstCtx, cancel := context.WithCancel(r.ctx)
+				r.burstCtxs = append(r.burstCtxs, cancel)
+				r.startWorker(burstCtx, true)
+			}
+		}
+	} else if metrics.TaskCompletionRate > metrics.TaskArrivalRate {
+		// System is over-provisioned
+		throughputSurplus := metrics.TaskCompletionRate - metrics.TaskArrivalRate
+		workersToRemove := int(math.Floor(throughputSurplus / throughputPerWorker))
+
+		toRemove := r.minInt(workersToRemove, int(stats.BurstWorkers))
+
+		if toRemove > 0 {
+			r.logger.Infof("Scaling down: removing %d burst workers due to low demand.", toRemove)
+			for i := 0; i < toRemove && len(r.burstCtxs) > 0; i++ {
+				lastIdx := len(r.burstCtxs) - 1
+				cancel := r.burstCtxs[lastIdx]
+				cancel()
+				r.burstCtxs = r.burstCtxs[:lastIdx]
+			}
 		}
 	}
 }
 
 // Stats returns a snapshot of the runner's current operational state.
-func (r *Runner[R, E]) Stats() TaskStats {
+func (r *Manager[R, E]) Stats() TaskStats {
 	return TaskStats{
 		BaseWorkers:        r.baseWorkerCount,
 		ActiveWorkers:      r.activeWorkers.Load(),
@@ -689,10 +836,17 @@ func (r *Runner[R, E]) Stats() TaskStats {
 	}
 }
 
+// Metrics returns a snapshot of the currently aggregated performance metrics.
+func (r *Manager[R, E]) Metrics() TaskMetrics {
+	return r.collector.Metrics()
+}
+
 // Stop gracefully shuts down the task manager by draining the task queues.
-func (r *Runner[R, E]) Stop() error {
+func (r *Manager[R, E]) Stop() error {
+	r.logger.Infof("Stop command received. Initiating graceful shutdown.")
 	// Set state to 'stopping' to prevent new tasks and guide worker exit.
 	if !r.transitionState(r.shutdownState.running, r.shutdownState.stopping) {
+		r.logger.Warnf("Stop command ignored: task manager already stopping or killed.")
 		return errors.New("task manager already stopping or killed")
 	}
 
@@ -703,20 +857,25 @@ func (r *Runner[R, E]) Stop() error {
 	r.cancel()
 
 	// Wait for all goroutines to finish.
+	r.logger.Infof("Waiting for all workers to finish...")
 	r.wg.Wait()
+	r.logger.Infof("All workers have finished.")
 
 	// Clean up the resource pool.
 	r.drainResourcePool()
 
+	r.logger.Infof("Task manager stopped gracefully.")
 	return nil
 }
 
 // Kill immediately terminates the task manager without draining queues.
-func (r *Runner[R, E]) Kill() error {
+func (r *Manager[R, E]) Kill() error {
+	r.logger.Warnf("Kill command received. Initiating immediate shutdown.")
 	// Set state to 'killed' to prevent new tasks and guide worker exit.
 	if !r.transitionState(r.shutdownState.running, r.shutdownState.killed) {
 		// If it's already 'stopping', we can escalate to 'killed'.
 		if !r.transitionState(r.shutdownState.stopping, r.shutdownState.killed) {
+			r.logger.Warnf("Kill command ignored: task manager already killed.")
 			return errors.New("task manager already killed")
 		}
 	}
@@ -728,25 +887,32 @@ func (r *Runner[R, E]) Kill() error {
 	r.cancel()
 
 	// Wait for all goroutines to finish.
+	r.logger.Infof("Waiting for all workers to terminate...")
 	r.wg.Wait()
+	r.logger.Infof("All workers have terminated.")
 
 	// Clean up the resource pool.
 	r.drainResourcePool()
 
+	r.logger.Warnf("Task manager killed.")
 	return nil
 }
 
 // shutdownBursting stops the burst manager and cancels all burst workers.
-func (r *Runner[R, E]) shutdownBursting() {
+func (r *Manager[R, E]) shutdownBursting() {
+	r.logger.Debugf("Shutting down burst manager.")
 	select {
 	case r.burstStop <- struct{}{}:
 	default:
 	}
 
 	r.burstMu.Lock()
-	for _, cancel := range r.burstCtxs {
-		cancel()
+	defer r.burstMu.Unlock()
+	if len(r.burstCtxs) > 0 {
+		r.logger.Infof("Cancelling %d burst workers.", len(r.burstCtxs))
+		for _, cancel := range r.burstCtxs {
+			cancel()
+		}
+		r.burstCtxs = nil
 	}
-	r.burstCtxs = nil
-	r.burstMu.Unlock()
 }
